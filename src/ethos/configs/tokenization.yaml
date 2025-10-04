@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - dataset: mimic
+  - dataset: omop
   - override hydra/launcher: joblib
 
 input_dir: ???
