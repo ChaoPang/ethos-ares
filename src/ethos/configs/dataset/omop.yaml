@@ -1,18 +1,13 @@
 name: omop
 stages:
 
-#  - name: preprocessing
-#    transforms:
-#      - LabData.retain_only_test_with_numeric_result
-#      - TransferData.retain_only_transfer_and_admit_types
-#      - DemographicData.retrieve_demographics_from_hosp_adm
-#      - DemographicData.process_race
-#      - DemographicData.process_marital_status
-#      - InpatientData.process_drg_codes
-#      - InpatientData.process_hospital_admissions
-#      - InpatientData.process_hospital_discharges # must be before processing diagnoses
-#      - HCPCSData.unify_names
-#    vocab: ${vocab}
+  - name: preprocessing
+    transforms:
+      - LabData.retain_only_test_with_numeric_result
+      - TransferData.retain_only_transfer_and_admit_types
+      - DemographicData.retrieve_demographics_from_hosp_adm
+      - HCPCSData.unify_names
+    vocab: ${vocab}
 
   - name: CodeCounter
     agg_to: ${output_dir}/${code_counts_fn}
@@ -28,28 +23,13 @@ stages:
   - name: preprocessing
     transforms:
       - DeathData.place_death_before_dc_if_same_time
-      - PatientFluidOutputData.make_quantiles
-      - BMIData.make_quantiles
       - MeasurementData.process_simple_measurements
-      - MeasurementData.process_pain
-      - MeasurementData.process_blood_pressure
-    vocab: ${vocab}
-
-  - name: preprocessing_with_num_quantiles
-    transforms:
-      - ICUStayData.process
-    params:
-      num_quantiles: ${num_quantiles}
     vocab: ${vocab}
 
   - name: Quantizator
     params:
       code_prefixes:
-        - LAB//Q//
-        - BMI//Q
-        - VITAL//Q//
-        - SUBJECT_FLUID_OUTPUT//Q//
-        - ED_ACUITY//Q
+        - LONIC/
     agg_to: ${output_dir}/${quantiles_fn}
     agg_params:
       num_quantiles: ${num_quantiles}
@@ -59,28 +39,18 @@ stages:
     params:
       code_quantiles: ${default_if_null:${vocab},${output_dir}}/${quantiles_fn}
 
-  - name: preprocessing
-    transforms:
-      - BMIData.join_token_and_quantile
-    vocab: ${vocab}
-
   - name: StaticDataCollector
     agg_to: ${output_dir}/static_data.pickle
     params:
       static_code_prefixes:
         - MEDS_BIRTH
         - GENDER
-        - MARITAL
-        - RACE
-        - BMI
 
   - name: filter_codes
     params:
       codes_to_remove:
         - MEDS_BIRTH
         - GENDER
-        - MARITAL
-        - RACE
       is_prefix: true
 
   - name: apply_vocab
