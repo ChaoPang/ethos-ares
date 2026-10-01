@@ -58,14 +58,29 @@ class StaticDataCollector(ScanAndAggregate):
             .agg("code", "time")
             .with_columns(pl.struct(code="code", time="time"))
             .pivot(index=self.patient_id_col, on="prefix", values="code")
-            .with_columns(
-                pl.when(pl.col(col_name).struct[0].is_null())
-                .then(pl.struct(code=pl.lit([f"{col_name}//UNKNOWN"])))
-                .otherwise(col_name)
-                .alias(col_name)
-                for col_name in static_code_prefixes
-                if col_name != ST.DOB
+        )
+        # a shard may contain no rows at all for some prefix (e.g. no patient in this
+        # shard has a recorded gender); the pivot then never creates that column
+        missing_cols = [
+            col_name
+            for col_name in static_code_prefixes
+            if col_name != ST.DOB and col_name not in df.columns
+        ]
+        if missing_cols:
+            df = df.with_columns(
+                pl.struct(
+                    code=pl.lit([f"{col_name}//UNKNOWN"]),
+                    time=pl.lit([None], dtype=pl.List(pl.Int64)),
+                ).alias(col_name)
+                for col_name in missing_cols
             )
+        df = df.with_columns(
+            pl.when(pl.col(col_name).struct[0].is_null())
+            .then(pl.struct(code=pl.lit([f"{col_name}//UNKNOWN"])))
+            .otherwise(col_name)
+            .alias(col_name)
+            for col_name in static_code_prefixes
+            if col_name != ST.DOB and col_name not in missing_cols
         )
         # maintain the order of columns, so that the output is deterministic
         return df.select(sorted(df.columns))

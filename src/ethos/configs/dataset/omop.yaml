@@ -6,6 +6,7 @@ stages:
       - LabData.retain_only_test_with_numeric_result
       - TransferData.retain_only_transfer_and_admit_types
       - DemographicData.retrieve_demographics_from_hosp_adm
+      - DemographicData.unify_gender_code
       - HCPCSData.unify_names
     vocab: ${vocab}
 
@@ -29,7 +30,7 @@ stages:
   - name: Quantizator
     params:
       code_prefixes:
-        - LONIC/
+        - LOINC/
     agg_to: ${output_dir}/${quantiles_fn}
     agg_params:
       num_quantiles: ${num_quantiles}

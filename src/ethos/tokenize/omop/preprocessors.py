@@ -33,6 +33,15 @@ class DemographicData:
     def retrieve_demographics_from_hosp_adm(df: pl.DataFrame) -> pl.DataFrame:
         return df
 
+    @staticmethod
+    @MatchAndRevise(prefix="Gender/")
+    def unify_gender_code(df: pl.DataFrame) -> pl.DataFrame:
+        """meds_etl.omop emits 'Gender/F' style codes; StaticDataCollector expects the
+        double-slash 'GENDER//F' convention used elsewhere in the pipeline."""
+        return df.with_columns(
+            code=pl.lit("GENDER//") + pl.col("code").str.split_exact("/", 1).struct[1]
+        )
+
 
 class InpatientData:
     @staticmethod
