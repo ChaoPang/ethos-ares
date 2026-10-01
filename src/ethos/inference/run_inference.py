@@ -55,7 +55,7 @@ def main(cfg: DictConfig):
     if cfg.temperature != 1.0:
         result_dir = result_dir.with_name(f"{result_dir.name}_temp{cfg.temperature}")
 
-    if "wandb_path" in model_checkpoint:
+    if model_checkpoint.get("wandb_path"):
         run_id = model_checkpoint["wandb_path"].split("/")[-1]
         result_dir = result_dir.with_name(f"{result_dir.name}_{run_id}")
 

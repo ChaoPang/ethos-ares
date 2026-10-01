@@ -16,9 +16,10 @@ def estimate_loss(
     if is_distributed:
         eval_iters = math.ceil(eval_iters / int(os.environ["WORLD_SIZE"]))
 
+    device = next(model.parameters()).device
     out = {}
     for split, dataloader in loaders:
-        losses = th.empty(eval_iters, device=model.device)
+        losses = th.empty(eval_iters, device=device)
         for i, (X, Y) in zip(range(eval_iters), dataloader):
             with ctx:
                 if isinstance(X, tuple):
