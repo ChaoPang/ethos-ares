@@ -15,12 +15,29 @@ def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> 
     subject_id isn't in the dataset, or whose prediction_time falls before that patient's
     first recorded token, are skipped.
     """
+    labels_fp = Path(labels_fp)
+    labels_source = str(labels_fp / "**" / "*.parquet") if labels_fp.is_dir() else labels_fp
+    labels_df = pl.read_parquet(labels_source).select(
+        "subject_id", "prediction_time", "boolean_value"
+    )
+
+    pred_time_dtype = labels_df.schema["prediction_time"]
+    if not isinstance(pred_time_dtype, pl.Datetime):
+        raise TypeError(
+            f"Expected 'prediction_time' in '{labels_fp}' to be a Datetime column, got "
+            f"{pred_time_dtype}. It must be an actual timestamp so its unit can be rescaled to "
+            "microseconds -- a raw integer column is ambiguous (unknown unit/epoch) and cannot "
+            "be matched against the tokenized dataset's `times` safely."
+        )
+
     labels_df = (
-        pl.read_parquet(labels_fp)
-        .select("subject_id", "prediction_time", "boolean_value")
-        # MEDS stores prediction_time as a datetime; casting to Int64 gives microseconds
-        # since epoch, matching the units `times` is stored in (see TimelineDataset.tensorize).
-        .with_columns(prediction_time=pl.col("prediction_time").cast(pl.Int64))
+        labels_df
+        # `times` is stored in microseconds since epoch (see TimelineDataset.tensorize), but a
+        # MEDS label's prediction_time may be written with a different precision (e.g. pandas/
+        # Spark commonly use nanoseconds) -- rescale explicitly rather than reinterpreting bits.
+        .with_columns(
+            prediction_time=pl.col("prediction_time").cast(pl.Datetime("us")).cast(pl.Int64)
+        )
         .sort("subject_id", "prediction_time")
     )
 
