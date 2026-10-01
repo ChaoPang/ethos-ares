@@ -1,0 +1,52 @@
+name: omop
+stages:
+
+  - name: preprocessing
+    transforms:
+      - TransferData.retain_only_transfer_and_admit_types
+      - DemographicData.retrieve_demographics_from_hosp_adm
+      - DemographicData.unify_gender_code
+      - HCPCSData.unify_names
+    vocab: ${vocab}
+
+  - name: filter_codes
+    params:
+      codes_to_remove:
+        - LOINC/
+      is_prefix: true
+
+  - name: preprocessing
+    transforms:
+      - DeathData.place_death_before_dc_if_same_time
+    vocab: ${vocab}
+
+  - name: StaticDataCollector
+    agg_to: ${output_dir}/static_data.pickle
+    params:
+      static_code_prefixes:
+        - MEDS_BIRTH
+        - GENDER
+
+  - name: filter_codes
+    params:
+      codes_to_remove:
+        - MEDS_BIRTH
+        - GENDER
+      is_prefix: true
+
+  - name: apply_vocab
+    params:
+      vocab: ${vocab}
+
+  - name: inject_time_intervals
+    params:
+      time_intervals_spec: ${time_intervals_spec}
+
+  - name: IntervalEstimator
+    params:
+      time_intervals_spec: ${time_intervals_spec}
+    agg_to: ${output_dir}/${intervals_fn}
+    skip: ${is_not_null:${vocab}}
+
+  - name: CodeCounter
+    agg_to: ${output_dir}/${code_counts_fn}
