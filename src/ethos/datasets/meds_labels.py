@@ -122,6 +122,11 @@ class MedsLabelledDataset(InferenceDataset):
     for a mortality label) -- the generation loop watches for it exactly like it does for the
     built-in tasks' outcome tokens. A label's `boolean_value` supplies the ground truth
     ("expected") that scoring compares the model's generated/sampled outcome against.
+
+    `include_base_stop_stokens` controls whether `InferenceDataset`'s default stop tokens
+    (ST.DEATH, ST.TIMELINE_END) are also watched for alongside `outcome_stoken`. Set to False
+    if the tokenized dataset doesn't contain one of those tokens at all (e.g. no deaths were
+    recorded) -- vocab.encode would otherwise raise a KeyError for every worker process.
     """
 
     def __init__(
@@ -131,11 +136,13 @@ class MedsLabelledDataset(InferenceDataset):
         outcome_stoken: str,
         n_positions: int = 2048,
         time_limit_days: float | None = None,
+        include_base_stop_stokens: bool = True,
         **kwargs,
     ):
         super().__init__(input_dir, n_positions, **kwargs)
+        base_stop_stokens = self.stop_stokens if include_base_stop_stokens else []
         self.stop_stokens = [outcome_stoken] + [
-            s for s in self.stop_stokens if s != outcome_stoken
+            s for s in base_stop_stokens if s != outcome_stoken
         ]
         self._outcome_stoken = outcome_stoken
         if time_limit_days is not None:
