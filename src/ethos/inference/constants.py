@@ -21,6 +21,10 @@ class Task(StrEnum):
     # the one below is called "ED reattendance" in the ED-Benchmark paper
     ED_REPRESENTATION = "ed_representation"
 
+    # generic task driven by externally supplied ACES/MEDS labels, rather than
+    # ground truth derived by scanning the record for what actually happened
+    MEDS_LABEL = "meds_label"
+
 
 class Reason(StrEnum):
     GOT_TOKEN = "token_of_interest"

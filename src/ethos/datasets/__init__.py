@@ -5,6 +5,7 @@ from .ed import (
     HospitalAdmissionAtTriageDataset,
 )
 from .hospital_mortality import HospitalMortalityDataset
+from .meds_labels import LabelledCohortDataset, MedsLabelledDataset
 from .mimic_icu import (
     DrgPredictionDataset,
     ICUAdmissionDataset,

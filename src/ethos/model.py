@@ -8,7 +8,7 @@ import transformers.activations
 from torch.nn import functional as F
 from transformers import GPT2Config
 
-ModelOutput = namedtuple("ModelOutput", ["loss", "logits"])
+ModelOutput = namedtuple("ModelOutput", ["loss", "logits", "hidden_states"], defaults=[None])
 
 
 class CausalSelfAttention(nn.Module):
@@ -155,7 +155,7 @@ class GPT2LMNoBiasModel(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def forward(self, input_ids, labels=None) -> ModelOutput:
+    def forward(self, input_ids, labels=None, output_hidden_states=False) -> ModelOutput:
         _, t = input_ids.size()
         if self.return_attention:
             self.attention_weights.clear()
@@ -174,7 +174,7 @@ class GPT2LMNoBiasModel(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        return ModelOutput(loss=loss, logits=logits)
+        return ModelOutput(loss=loss, logits=logits, hidden_states=x if output_hidden_states else None)
 
     @torch.no_grad()
     def get_next_token(self, x: torch.Tensor, return_probs: bool = False, top_k: int | None = None):

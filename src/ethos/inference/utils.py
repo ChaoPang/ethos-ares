@@ -17,6 +17,7 @@ from ..datasets import (
     ICUAdmissionDataset,
     ICUMortalityDataset,
     ICUReadmissionDataset,
+    MedsLabelledDataset,
     ReadmissionDataset,
     SofaPredictionDataset,
 )
@@ -56,6 +57,8 @@ def get_dataset_cls(task: Task) -> type[InferenceDataset]:
             return CriticalOutcomeAtTriageDataset
         case Task.ED_REPRESENTATION:
             return EdReattendenceDataset
+        case Task.MEDS_LABEL:
+            return MedsLabelledDataset
         case _:
             raise ValueError(f"Unknown task: {task}, available are {', '.join(Task)}")
 

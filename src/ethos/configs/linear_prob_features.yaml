@@ -1,0 +1,15 @@
+model_fp: ???
+input_dir: ???
+labels_fp: ???
+output_dir: "linear_prob_features"
+output_fn: null
+
+# if true, mean-pool hidden states across the whole context window instead of taking the
+# last token's hidden state
+average_over_sequence: false
+
+device: "cuda" # "cuda" or "cpu"
+no_compile: false
+
+hydra:
+  output_subdir: null
