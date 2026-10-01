@@ -118,10 +118,12 @@ class MedsLabelledDataset(InferenceDataset):
     labels (subject_id, prediction_time, boolean_value), instead of requiring the ground truth
     be reconstructable by scanning the raw timeline for what actually happened next.
 
-    `outcome_stoken` names the special token that represents a positive outcome (e.g. ST.DEATH
-    for a mortality label) -- the generation loop watches for it exactly like it does for the
-    built-in tasks' outcome tokens. A label's `boolean_value` supplies the ground truth
-    ("expected") that scoring compares the model's generated/sampled outcome against.
+    `outcome_stoken` names the special token(s) that represent a positive outcome (e.g.
+    ST.DEATH for a mortality label, or several admission-type codes for a readmission label
+    when no single canonical "admission" token exists in the vocabulary) -- the generation loop
+    watches for any of them exactly like it does for the built-in tasks' outcome tokens. A
+    label's `boolean_value` supplies the ground truth ("expected") that scoring compares the
+    model's generated/sampled outcome against.
 
     `include_base_stop_stokens` controls whether `InferenceDataset`'s default stop tokens
     (ST.DEATH, ST.TIMELINE_END) are also watched for alongside `outcome_stoken`. Set to False
@@ -133,18 +135,21 @@ class MedsLabelledDataset(InferenceDataset):
         self,
         input_dir: str | Path,
         labels_fp: str | Path,
-        outcome_stoken: str,
+        outcome_stoken: str | list[str],
         n_positions: int = 2048,
         time_limit_days: float | None = None,
         include_base_stop_stokens: bool = True,
         **kwargs,
     ):
         super().__init__(input_dir, n_positions, **kwargs)
+        outcome_stokens = (
+            [outcome_stoken] if isinstance(outcome_stoken, str) else list(outcome_stoken)
+        )
         base_stop_stokens = self.stop_stokens if include_base_stop_stokens else []
-        self.stop_stokens = [outcome_stoken] + [
-            s for s in base_stop_stokens if s != outcome_stoken
+        self.stop_stokens = outcome_stokens + [
+            s for s in base_stop_stokens if s not in outcome_stokens
         ]
-        self._outcome_stoken = outcome_stoken
+        self._outcome_stokens = set(outcome_stokens)
         if time_limit_days is not None:
             self.time_limit = timedelta(days=time_limit_days)
         self.start_indices, self.labels = _resolve_label_indices(self, labels_fp)
@@ -156,7 +161,7 @@ class MedsLabelledDataset(InferenceDataset):
         start_idx = self.start_indices[idx]
         row = self.labels[idx]
         y = {
-            "expected": self._outcome_stoken if row["boolean_value"] else "NEGATIVE",
+            "expected": "POSITIVE" if row["boolean_value"] else "NEGATIVE",
             "true_token_dist": None,
             "true_token_time": None,
             "patient_id": row["subject_id"],
