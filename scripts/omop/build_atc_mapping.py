@@ -6,7 +6,7 @@ non-standard codes (e.g., NDC) are first mapped to standard concepts via 'Maps t
 linked to their ATC 5th level ancestors via CONCEPT_ANCESTOR.
 
 Usage:
-    python scripts/omop/build_atc_mapping.py /path/to/athena_vocab drug_to_atc.csv \
+    python scripts/omop/build_atc_mapping.py /path/to/omop_vocab drug_to_atc.csv \
         [--code-counts /path/to/code_counts.csv]
 """
 
@@ -19,9 +19,16 @@ DRUG_VOCABULARIES = ["RxNorm", "RxNorm Extension", "NDC"]
 
 
 def scan_athena_table(vocab_dir: Path, name: str) -> pl.LazyFrame:
-    return pl.scan_csv(
-        vocab_dir / f"{name}.csv", separator="\t", quote_char=None, infer_schema=False
-    )
+    """Reads a vocabulary table stored either as Athena's tab-separated CSV (CONCEPT.csv) or as
+    parquet, as a file or a directory of files (concept.parquet, concept/*.parquet)."""
+    for table_name in [name, name.lower()]:
+        if (fp := vocab_dir / f"{table_name}.csv").is_file():
+            return pl.scan_csv(fp, separator="\t", quote_char=None, infer_schema=False)
+        if (fp := vocab_dir / f"{table_name}.parquet").is_file():
+            return pl.scan_parquet(fp)
+        if (fp := vocab_dir / table_name).is_dir():
+            return pl.scan_parquet(fp / "**/*.parquet")
+    raise FileNotFoundError(f"Table '{name}' not found in {vocab_dir} (as CSV or parquet)")
 
 
 def build_mapping(vocab_dir: Path) -> pl.DataFrame:
