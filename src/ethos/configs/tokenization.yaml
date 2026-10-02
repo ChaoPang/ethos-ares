@@ -8,6 +8,10 @@ output_dir: data/tokenized_datasets
 out_fn: null
 vocab: null
 num_quantiles: 10
+# codes seen fewer times than this in the training data are left out of the vocabulary
+min_code_count: 1
+# drug-to-ATC mapping for OMOP datasets, built with scripts/omop/build_atc_mapping.py
+atc_mapping_fp: null
 
 code_counts_fn: code_counts.csv
 quantiles_fn: quantiles.json

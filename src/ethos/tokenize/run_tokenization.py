@@ -81,7 +81,13 @@ def main(cfg: DictConfig):
                 )
             vocab.add_words(static_codes)
 
-            codes = pl.read_csv(output_dir / cfg.code_counts_fn, columns="code")["code"].to_list()
+            code_counts = pl.read_csv(output_dir / cfg.code_counts_fn)
+            codes = code_counts.filter(pl.col("count") >= cfg.min_code_count)["code"].to_list()
+            if len(codes) < len(code_counts):
+                logger.info(
+                    f"Dropping {len(code_counts) - len(codes):,}/{len(code_counts):,} codes seen "
+                    f"fewer than {cfg.min_code_count} times"
+                )
             vocab.add_words(codes)
             # Age is encoded with quantile tokens, which datasets without quantized lab data
             # (e.g., omop_no_lab) never produce, so always make sure they are in the vocab.

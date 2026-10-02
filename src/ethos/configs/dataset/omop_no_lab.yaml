@@ -7,6 +7,15 @@ stages:
       - DemographicData.retrieve_demographics_from_hosp_adm
       - DemographicData.unify_gender_code
       - HCPCSData.unify_names
+      - DiagnosesData.split_icd_codes
+      - ProcedureData.split_icd_codes
+    vocab: ${vocab}
+
+  - name: preprocessing
+    transforms:
+      - MedicationData.convert_to_atc
+    params:
+      atc_mapping_fp: ${atc_mapping_fp}
     vocab: ${vocab}
 
   - name: filter_codes

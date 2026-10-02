@@ -1,3 +1,5 @@
+import functools
+
 import polars as pl
 
 from ..constants import MAPPINGS_DIR
@@ -83,6 +85,18 @@ def get_mimic_drug_name_to_atc_mapping() -> dict[str, list[str]]:
         .agg(pl.col("atc_code").unique(maintain_order=True))
     )
     return dict(zip(df["drug"], df["atc_code"].to_list()))
+
+
+@functools.lru_cache
+def get_omop_drug_to_atc_mapping(mapping_fp: str) -> dict[str, list[str]]:
+    """Reads the drug-to-ATC mapping built by `scripts/omop/build_atc_mapping.py`, which maps
+    OMOP drug codes (e.g., RxNorm/209387) to their 7-character ATC codes."""
+    df = (
+        pl.read_csv(mapping_fp, schema={"code": pl.String, "atc_code": pl.String})
+        .group_by("code", maintain_order=True)
+        .agg(pl.col("atc_code").unique(maintain_order=True))
+    )
+    return dict(zip(df["code"], df["atc_code"].to_list()))
 
 
 def get_atc_code_to_desc() -> dict[str, str]:

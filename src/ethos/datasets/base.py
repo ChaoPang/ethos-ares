@@ -15,6 +15,9 @@ from ..tokenize.patterns import MatchAndRevise
 from ..vocabulary import Vocabulary
 from ._sharded_data import ShardedData
 
+# prefixes of tokens that continue a code split into multiple tokens (ICD-10-CM and ATC)
+CONTINUATION_TOKEN_PREFIXES = ["ICD//CM//3-6//", "ICD//CM//SFX//", "ATC//4//", "ATC//SFX//"]
+
 
 class TimelineDataset(th.utils.data.Dataset):
     def __init__(
@@ -153,8 +156,20 @@ class TimelineDataset(th.utils.data.Dataset):
 
     @staticmethod
     def tensorize(in_fp: str | Path | list, out_fp: str | Path, vocab: Vocabulary):
+        # Codes split into multiple tokens (e.g., ICD//CM//<category>, ICD//CM//3-6//10) are
+        # truncated at the first token that is not in the vocabulary (e.g., dropped because of
+        # `min_code_count`), so that no continuation token is left without its preceding part.
+        is_continuation = pl.any_horizontal(
+            pl.col("code").str.starts_with(prefix) for prefix in CONTINUATION_TOKEN_PREFIXES
+        )
         df = (
             pl.scan_parquet(in_fp)
+            .with_columns(code_group=(~is_continuation).cum_sum())
+            .filter(
+                pl.col("code").is_in(list(vocab.stoi)).cast(pl.UInt8).cum_min().over("code_group")
+                == 1
+            )
+            .drop("code_group")
             .with_columns(
                 tokens=pl.col("code").replace_strict(vocab.stoi, return_dtype=pl.Int64),
                 times=pl.col("time").cast(pl.Int64),
