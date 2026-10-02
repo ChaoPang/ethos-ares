@@ -4,9 +4,12 @@
 # Usage:
 #   export input_dir=/path/to/meds/data   # must contain train/ and tuning/ subdirectories
 #   export output_dir=/path/to/output
+#   export OMOP_VOCAB_DIR=/path/to/omop  # with the concept, concept_relationship and
+#                                        # concept_ancestor tables (CSV or parquet)
 #   ./scripts/run_omop_pipeline.sh
 #
-#   export ATC_MAPPING_FP=/path/to/drug_to_atc.csv  # built with scripts/omop/build_atc_mapping.py
+# The drug-to-ATC mapping is built from OMOP_VOCAB_DIR into $output_dir/drug_to_atc.csv, unless
+# it already exists or ATC_MAPPING_FP points to a prebuilt one.
 #
 # Override any default below by exporting the same-named variable before running,
 # e.g. `export DATASET=omop_no_lab` to skip lab/LOINC data.
@@ -15,7 +18,6 @@ set -e
 
 : "${input_dir:?input_dir must be set, e.g. export input_dir=/path/to/meds/data}"
 : "${output_dir:?output_dir must be set, e.g. export output_dir=/path/to/output}"
-: "${ATC_MAPPING_FP:?ATC_MAPPING_FP must be set, build it with scripts/omop/build_atc_mapping.py}"
 
 if [[ ! -d "$input_dir/train" || ! -d "$input_dir/tuning" ]]; then
     echo "Expected '$input_dir/train' and '$input_dir/tuning' to exist." >&2
@@ -26,6 +28,8 @@ fi
 DATASET=${DATASET:-omop}             # or omop_no_lab to skip LOINC/lab data
 NUM_WORKERS=${NUM_WORKERS:-$(nproc)}
 MIN_CODE_COUNT=${MIN_CODE_COUNT:-10} # codes seen fewer times in train are left out of the vocab
+
+ATC_MAPPING_FP=${ATC_MAPPING_FP:-${output_dir%/}/drug_to_atc.csv}
 
 # --- model / training ---
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}
@@ -45,6 +49,12 @@ LR_DECAY_ITERS=${LR_DECAY_ITERS:-100000}
 
 train_path="${output_dir%/}/train"
 model_name="layer_${N_LAYER}_do_${DROPOUT}"
+
+if [[ ! -f "$ATC_MAPPING_FP" ]]; then
+    : "${OMOP_VOCAB_DIR:?OMOP_VOCAB_DIR must be set to build the drug-to-ATC mapping}"
+    echo "=== Building drug-to-ATC mapping from '$OMOP_VOCAB_DIR' into '$ATC_MAPPING_FP' ==="
+    python "$(dirname "$0")/omop/build_atc_mapping.py" "$OMOP_VOCAB_DIR" "$ATC_MAPPING_FP"
+fi
 
 echo "=== Tokenizing '$input_dir/train' (dataset=$DATASET) with $NUM_WORKERS worker(s), building vocab ==="
 ethos_tokenize -m worker="range(0,${NUM_WORKERS})" \
