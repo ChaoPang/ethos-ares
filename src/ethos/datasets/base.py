@@ -136,7 +136,9 @@ class TimelineDataset(th.utils.data.Dataset):
 
     def _age_to_tokens(self, age_years: float) -> tuple[str, str]:
         age_scaled = age_years * self._num_quantiles**2 / 100
-        age_scaled = min(age_scaled, self._num_quantiles**2 - 1)
+        # events dated before birth (e.g., data errors or de-identification date shifts) would
+        # give a negative age, so it is clipped to 0
+        age_scaled = min(max(age_scaled, 0), self._num_quantiles**2 - 1)
 
         age_t1 = int(age_scaled // self._num_quantiles)
         age_t2 = round(age_scaled % self._num_quantiles)
