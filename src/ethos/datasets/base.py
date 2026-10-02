@@ -28,6 +28,11 @@ class TimelineDataset(th.utils.data.Dataset):
 
         self.vocab = Vocabulary.from_path(input_dir)
         self._num_quantiles = len(self.vocab.quantile_stokens)
+        if self._num_quantiles == 0:
+            raise ValueError(
+                f"Vocabulary in {input_dir} has no quantile tokens (Q1, Q2, ...), which are "
+                "required to encode age. Re-run tokenization to rebuild the vocabulary."
+            )
         self.static_data = pickle.load((input_dir / STATIC_DATA_FN).open("rb"))
 
         # plus one, because DOB takes 2 spots

@@ -83,6 +83,9 @@ def main(cfg: DictConfig):
 
             codes = pl.read_csv(output_dir / cfg.code_counts_fn, columns="code")["code"].to_list()
             vocab.add_words(codes)
+            # Age is encoded with quantile tokens, which datasets without quantized lab data
+            # (e.g., omop_no_lab) never produce, so always make sure they are in the vocab.
+            vocab.add_words([f"Q{i}" for i in range(1, cfg.num_quantiles + 1)])
         else:
             vocab = Vocabulary.from_path(cfg.vocab)
             if (quantile_fp := Path(cfg.vocab) / cfg.quantiles_fn).exists():
