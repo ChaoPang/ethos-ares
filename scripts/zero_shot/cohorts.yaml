@@ -1,0 +1,44 @@
+# Outcome definition per cohort for run_zero_shot.py.
+#
+# outcome_stokens: tokens that count as the event. A trajectory is generated from each label's
+#   prediction_time until it produces one of them (event), a stop token (MEDS_DEATH or
+#   TIMELINE_END, no event) or runs past time_limit_days (no event). The predicted risk is the
+#   share of trajectories that end in an event. Use the token spelling of the tokenized vocab,
+#   which is upper case with underscores, e.g. VISIT/IP and CMS_PLACE_OF_SERVICE/51.
+# time_limit_days: the label's horizon.
+# strict_cutoff: true keeps only events strictly before prediction_time, for labels made at the
+#   very event that defines the outcome.
+#
+# ETHOS's own 30-day readmission benchmark also counts death as an event; add MEDS_DEATH to
+# outcome_stokens to do the same.
+
+hf_readmission_sample:
+  # the admission codes of tokenize/omop/preprocessors.py (HOSPITAL_ADMISSION itself is never
+  # produced for OMOP data)
+  outcome_stokens:
+    - VISIT/IP
+    - VISIT/ERIP
+    - CMS_PLACE_OF_SERVICE/51
+    - CMS_PLACE_OF_SERVICE/61
+  time_limit_days: 30
+  strict_cutoff: false
+
+# --- t2dm_hf_sample: heart failure after type 2 diabetes ---------------------------------------
+# Derived from CEHR-GPT's time_to_event/config/t2dm_hf_ethos.yaml. Its seed concepts are ICD10CM
+# I50, I50.84, I50.89, I50.9 and ICD9CM 428, 428.9, 404.13 (include_descendants adds nothing: ICD
+# concepts have no rows in concept_ancestor). CEHR-GPT matches token paths, so the one-token paths
+# for I50 and 428 are prefix wildcards for every I50.* and 428.* code.
+# The ETHOS tokenizer turns both families into the same category token (ICD-9 428.* is converted
+# to I50.*), so one stop token is the whole definition:
+#   ICD10CM/I50.9 -> ICD//CM//HEART_FAILURE, ICD//CM//3-6//9
+#   ICD9CM/428.0  -> ICD//CM//HEART_FAILURE
+# 404.13 becomes two tokens (ICD//CM//HYPERTENSIVE_HEART_AND_CHRONIC_KIDNEY_DISEASE,
+# ICD//CM//3-6//2), which cannot be a stop token, and the category alone also covers I13.10/I13.11
+# without heart failure. It is left out, which drops only that rare code.
+# CEHR-GPT ignores events in the first 30 days (prediction_window_start) and has no end
+# (prediction_window_end: -1). ethos_infer stops at the first outcome token wherever it falls, so
+# the 30 day start is not applied, and time_limit_days must be the label's follow-up.
+#
+#t2dm_hf_sample:
+#  outcome_stokens: [ICD//CM//HEART_FAILURE]
+#  time_limit_days: ???   # the label's horizon, check time_to_event in the sample

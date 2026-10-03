@@ -1,0 +1,392 @@
+"""Zero-shot evaluation of a pretrained ETHOS checkpoint on MEDS label cohorts.
+
+For every label (subject_id, prediction_time, boolean_value) the model is given the patient's
+history up to prediction_time and generates `rep_num` future trajectories. A trajectory ends when
+it produces an outcome token (an event), a stop token (death or end of the record) or when its
+generated time passes the cohort's time limit. The share of trajectories that ended in an event is
+the predicted risk, which is scored against boolean_value. This mirrors ETHOS's own 30-day
+readmission benchmark, with the outcome tokens taken from cohorts.yaml.
+
+The labels are matched to the tokenized split they belong to, so use the split the label patients
+come from (the zero-shot cohort samples are cut from held_out).
+
+Usage:
+    python scripts/zero_shot/run_zero_shot.py \
+        --model-fp /path/to/best_model.pt \
+        --cohorts-dir ~/ohdsi.../ethos_zero_shot_cohorts \
+        --tokenized-dir /path/to/ethos-output \
+        --out-dir /path/to/zero_shot \
+        --cohorts hf_readmission_sample
+
+Rerunning continues where it stopped: the labels are cut into shards, finished shards are skipped
+and the scores are recomputed from all of them. Rerunning with a different checkpoint, labels,
+tokenized data or setting stops with an error instead of mixing results.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+from omegaconf import OmegaConf
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from ethos.constants import SpecialToken as ST
+from ethos.datasets import MedsLabelledDataset
+from ethos.vocabulary import Vocabulary
+
+STOP_REASONS_KEPT = ("token_of_interest", "time_limit")  # key_error means an undecodable token
+
+
+def parquet_files(path: Path) -> list[Path]:
+    path = path.expanduser()
+    return sorted(path.rglob("*.parquet")) if path.is_dir() else [path]
+
+
+def file_signature(paths: list[Path]) -> list[str]:
+    return [f"{p.resolve()}|{p.stat().st_size}|{p.stat().st_mtime_ns}" for p in paths]
+
+
+def hydra_list(values: list[str]) -> str:
+    return "[" + ",".join(f"'{v}'" for v in values) + "]"
+
+
+def check_tokens(vocab: Vocabulary, tokens: list[str], cohort: str) -> None:
+    missing = [t for t in tokens if t not in vocab.stoi]
+    if not missing:
+        return
+    lines = []
+    for token in missing:
+        key = token.upper().replace(" ", "_")
+        close = [t for t in vocab.stoi if t.upper().replace(" ", "_") == key]
+        lines.append(f"  {token}" + (f"  (did you mean {close}?)" if close else ""))
+    raise ValueError(f"[{cohort}] outcome tokens not in the tokenized vocab:\n" + "\n".join(lines))
+
+
+def build_eval_set(
+    labels_fp: Path, tok_dir: Path, cohort_cfg: dict, max_labels: int, seed: int
+) -> pl.DataFrame:
+    """The labels that belong to the tokenized split, as they are matched to its patients."""
+    ds = MedsLabelledDataset(
+        input_dir=tok_dir,
+        labels_fp=labels_fp,
+        outcome_stoken=list(cohort_cfg["outcome_stokens"]),
+        include_base_stop_stokens=False,
+        strict_cutoff=bool(cohort_cfg.get("strict_cutoff", False)),
+    )
+    rows = pl.DataFrame(ds.labels)
+    if max_labels and len(rows) > max_labels:
+        keep = np.sort(np.random.default_rng(seed).permutation(len(rows))[:max_labels])
+        rows = rows[keep.tolist()]
+    return rows.with_columns(pl.from_epoch("prediction_time", time_unit="us"))
+
+
+def write_shards(eval_set: pl.DataFrame, out: Path, shard_size: int) -> list[Path]:
+    n_shards = max(1, math.ceil(len(eval_set) / shard_size))
+    shard_dirs = []
+    for i in range(n_shards):
+        shard_dir = out / "shards" / f"shard_{i:04d}"
+        labels_dir = shard_dir / "labels"
+        if not labels_dir.exists():
+            labels_dir.mkdir(parents=True)
+            eval_set[i * shard_size : (i + 1) * shard_size].write_parquet(
+                labels_dir / "labels.parquet"
+            )
+        shard_dirs.append(shard_dir)
+    return shard_dirs
+
+
+def result_files(shard_dir: Path) -> list[Path]:
+    return sorted((shard_dir / "results").rglob("samples_*.parquet"))
+
+
+def run_shard(shard_dir, gpu, args, cohort_cfg, model_fp, tok_dir, include_base) -> bool:
+    if (shard_dir / ".done").exists():
+        return True
+    n_labels = pl.read_parquet(shard_dir / "labels" / "labels.parquet").height
+    shutil.rmtree(shard_dir / "results", ignore_errors=True)  # partial output of an earlier run
+
+    cmd = [
+        sys.executable, "-m", "ethos.inference.run_inference",
+        "task=meds_label",
+        f"model_fp={model_fp}",
+        f"input_dir={tok_dir}",
+        f"output_dir={shard_dir / 'results'}",
+        "output_fn=run",
+        f"+dataset_kwargs.labels_fp={shard_dir / 'labels'}",
+        f"+dataset_kwargs.outcome_stoken={hydra_list(cohort_cfg['outcome_stokens'])}",
+        f"+dataset_kwargs.time_limit_days={cohort_cfg['time_limit_days']}",
+        f"+dataset_kwargs.include_base_stop_stokens={str(include_base).lower()}",
+        f"+dataset_kwargs.strict_cutoff={str(bool(cohort_cfg.get('strict_cutoff', False))).lower()}",
+        f"device={'cpu' if gpu is None else 'cuda'}",
+        f"n_jobs={args.jobs_per_gpu}",
+        "n_gpus=1",
+        f"rep_num={args.rep_num}",
+        "no_compile=true",
+        f"timeout={args.timeout}",
+        f"seed={args.seed}",
+        f"hydra.run.dir={shard_dir / 'hydra'}",
+    ]
+    env = dict(os.environ)
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    with open(shard_dir / "run.log", "w") as log:
+        returncode = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
+
+    # ethos_infer exits 0 even if a worker died and the progress queue timed out, so count rows
+    n_rows = sum(
+        pl.scan_parquet(f, glob=False).select(pl.len()).collect().item()
+        for f in result_files(shard_dir)
+    )
+    ok = returncode == 0 and n_rows == n_labels * args.rep_num
+    if ok:
+        (shard_dir / ".done").touch()
+    else:
+        print(
+            f"  {shard_dir}: {n_rows} of {n_labels * args.rep_num} trajectories "
+            f"(exit code {returncode}), see {shard_dir / 'run.log'}",
+            file=sys.stderr,
+        )
+    return ok
+
+
+def score(
+    out: Path, eval_set: pl.DataFrame, labels_all: pl.DataFrame, cohort_cfg: dict, rep_num: int
+) -> dict:
+    files = [f for shard in sorted((out / "shards").glob("shard_*")) for f in result_files(shard)]
+    results = pl.concat([pl.read_parquet(f, glob=False) for f in files], how="diagonal")
+    if results.height != eval_set.height * rep_num:
+        raise RuntimeError(
+            f"{results.height} trajectories for {eval_set.height} labels x {rep_num}: incomplete"
+        )
+    kept = results.filter(pl.col("stop_reason").is_in(STOP_REASONS_KEPT))
+    outcome = list(cohort_cfg["outcome_stokens"])
+
+    predictions = (
+        kept.group_by("patient_id", "prediction_time")
+        .agg(
+            risk=pl.col("actual").is_in(outcome).mean(),
+            n_trajectories=pl.len(),
+            y=pl.col("boolean_value").first(),
+        )
+        .rename({"patient_id": "subject_id"})
+        .with_columns(pl.from_epoch("prediction_time", time_unit="us"))
+    )
+    extra = [c for c in ("time_to_event",) if c in labels_all.columns]
+    if extra:
+        predictions = predictions.join(
+            labels_all.select("subject_id", "prediction_time", *extra).unique(
+                ["subject_id", "prediction_time"]
+            ),
+            on=["subject_id", "prediction_time"],
+            how="left",
+        )
+    predictions.write_parquet(out / "predictions.parquet")
+
+    def metrics(df: pl.DataFrame) -> dict:
+        y = df["y"].to_numpy()
+        if len(set(y.tolist())) < 2:
+            return {"n": len(y), "auroc": None, "auprc": None}
+        return {
+            "n": len(y),
+            "prevalence": float(y.mean()),
+            "auroc": float(roc_auc_score(y, df["risk"].to_numpy())),
+            "auprc": float(average_precision_score(y, df["risk"].to_numpy())),
+        }
+
+    res = {
+        "labels": eval_set.height,
+        "trajectories": results.height,
+        "trajectories_dropped_key_error": results.height - kept.height,
+        "labels_without_valid_trajectory": eval_set.height - predictions.height,
+        "share_ended_by_time_limit": float(
+            (kept["stop_reason"] == "time_limit").mean() if kept.height else float("nan")
+        ),
+        "mean_risk": float(predictions["risk"].mean()),
+        "rep_num": rep_num,
+        "all_labels": metrics(predictions),
+    }
+    if "time_to_event" in predictions.columns:
+        # like ETHOS's "Reduced" readmission score: a negative only counts if the patient was
+        # followed for the whole horizon, otherwise a readmission may simply not be recorded
+        horizon = cohort_cfg["time_limit_days"]
+        res["fully_followed_labels"] = metrics(
+            predictions.filter(pl.col("y") | (pl.col("time_to_event") >= horizon))
+        )
+    (out / "metrics.json").write_text(json.dumps(res, indent=2))
+    return res
+
+
+def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
+    out = Path(args.out_dir) / cohort
+    out.mkdir(parents=True, exist_ok=True)
+    tok_dir = Path(args.tokenized_dir) / args.split
+    labels_fp = Path(args.cohorts_dir) / cohort
+    model_fp = Path(args.model_fp)
+
+    vocab = Vocabulary.from_path(tok_dir)
+    train_vocab = sorted((Path(args.tokenized_dir) / "train").glob("vocab_t*.csv"))
+    split_vocab = sorted(tok_dir.glob("vocab_t*.csv"))
+    if train_vocab and (not split_vocab or split_vocab[0].read_bytes() != train_vocab[0].read_bytes()):
+        raise ValueError(
+            f"[{cohort}] the {args.split} split was not tokenized with the train vocab. "
+            f"Retokenize it with vocab={Path(args.tokenized_dir) / 'train'}."
+        )
+    outcome = list(cohort_cfg["outcome_stokens"])
+    check_tokens(vocab, outcome, cohort)
+    base = [str(ST.DEATH), str(ST.TIMELINE_END)]
+    include_base = all(t in vocab.stoi for t in base)
+    if not include_base:
+        print(f"[{cohort}] {base} are not all in the vocab, so they are not used as stop tokens")
+
+    signature = hashlib.sha1(
+        json.dumps(
+            {
+                "model": file_signature([model_fp]),
+                "labels": file_signature(parquet_files(labels_fp)),
+                "tokenized": file_signature(sorted(tok_dir.glob("*.pickle")) + sorted(tok_dir.glob("vocab_t*.csv")))
+                + [str(len(list(tok_dir.glob("[0-9]*.safetensors"))))],
+                "cohort": OmegaConf.to_container(OmegaConf.create(cohort_cfg)),
+                "rep_num": args.rep_num, "max_labels": args.max_labels,
+                "shard_size": args.shard_size, "seed": args.seed, "split": args.split,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    sig_fp = out / "signature"
+    if sig_fp.exists() and sig_fp.read_text() != signature:
+        raise RuntimeError(
+            f"[{cohort}] {out} was made with a different checkpoint, labels, tokenized data or "
+            "setting. Delete it or use another --out-dir."
+        )
+
+    eval_fp = out / "eval_set.parquet"
+    if eval_fp.exists():
+        eval_set = pl.read_parquet(eval_fp)
+    else:
+        print(f"[{cohort}] matching labels to the {args.split} split")
+        eval_set = build_eval_set(
+            labels_fp, tok_dir, cohort_cfg, args.max_labels, args.seed
+        )
+        eval_set.write_parquet(eval_fp)
+    n_label_rows = sum(
+        pl.scan_parquet(f, glob=False).select(pl.len()).collect().item()
+        for f in parquet_files(labels_fp)
+    )
+    match_rate = eval_set.height / max(n_label_rows, 1) if not args.max_labels else 1.0
+    if match_rate < 0.98:
+        print(
+            f"[{cohort}] WARNING: only {eval_set.height:,} of {n_label_rows:,} labels "
+            f"({match_rate:.1%}) belong to patients of the {args.split} split. If these labels "
+            "were cut from that split, its tokenization is incomplete or it is the wrong split.",
+            file=sys.stderr,
+        )
+    sig_fp.write_text(signature)
+    print(f"[{cohort}] {eval_set.height:,} labels, {int(eval_set['boolean_value'].sum()):,} positive")
+
+    shard_dirs = write_shards(eval_set, out, args.shard_size)
+    pending = [d for d in shard_dirs if not (d / ".done").exists()]
+    print(f"[{cohort}] {len(shard_dirs) - len(pending)}/{len(shard_dirs)} shards already done")
+
+    failed = []
+    lock = threading.Lock()
+
+    def worker(w: int):
+        for shard_dir in pending[w :: len(gpus)]:
+            try:
+                ok = run_shard(shard_dir, gpus[w], args, cohort_cfg, model_fp, tok_dir, include_base)
+            except Exception as e:  # an exception in a thread would otherwise vanish silently
+                print(f"  {shard_dir}: {type(e).__name__}: {e}", file=sys.stderr)
+                ok = False
+            with lock:
+                print(f"[{cohort}] {shard_dir.name} {'done' if ok else 'FAILED'}", flush=True)
+                if not ok:
+                    failed.append(shard_dir.name)
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(len(gpus))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    unfinished = [d.name for d in shard_dirs if not (d / ".done").exists()]
+    if failed or unfinished:
+        raise RuntimeError(
+            f"[{cohort}] unfinished shards: {sorted(set(failed) | set(unfinished))}. "
+            "Rerun to retry them."
+        )
+
+    labels_all = pl.concat(
+        [pl.read_parquet(f) for f in parquet_files(labels_fp)], how="diagonal"
+    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+    return score(out, eval_set, labels_all, cohort_cfg, args.rep_num)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--model-fp", required=True)
+    parser.add_argument("--cohorts-dir", required=True, help="folder with one folder per cohort")
+    parser.add_argument("--tokenized-dir", required=True, help="has the tokenized splits")
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--config", default=str(Path(__file__).with_name("cohorts.yaml")))
+    parser.add_argument("--cohorts", nargs="+", help="default: every cohort in the config")
+    parser.add_argument("--split", default="held_out", help="tokenized split the labels belong to")
+    parser.add_argument("--max-labels", type=int, default=0, help="0: all labels of the cohort")
+    parser.add_argument("--rep-num", type=int, default=10, help="trajectories per label")
+    parser.add_argument("--shard-size", type=int, default=500, help="labels per ethos_infer run")
+    parser.add_argument("--gpu-ids", nargs="*", help="default: all visible GPUs, else the CPU")
+    parser.add_argument("--jobs-per-gpu", type=int, default=2, help="processes sharing a GPU")
+    parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)  # a dropped SSH session must not stop the run
+
+    config = OmegaConf.to_container(OmegaConf.load(args.config))
+    cohorts = args.cohorts or list(config)
+    unknown = [c for c in cohorts if c not in config]
+    if unknown:
+        raise SystemExit(f"Not in {args.config}: {unknown}. Add their outcome definition first.")
+
+    if args.gpu_ids is not None:
+        gpus = [int(g) for g in args.gpu_ids] or [None]
+    else:
+        import torch
+
+        gpus = list(range(torch.cuda.device_count())) or [None]
+    print(f"Model: {args.model_fp}\nCohorts: {cohorts}\nGPUs: {gpus} (None = CPU)")
+
+    summary, failures = [], []
+    for cohort in cohorts:
+        try:
+            res = run_cohort(cohort, config[cohort], args, gpus)
+        except Exception as e:  # keep going with the other cohorts
+            failures.append(cohort)
+            print(f"[{cohort}] FAILED: {e}", file=sys.stderr)
+            continue
+        summary.append({"cohort": cohort, **{k: v for k, v in res.items() if not isinstance(v, dict)},
+                        **{f"{k}_{m}": v for k, d in res.items() if isinstance(d, dict) for m, v in d.items()}})
+
+    if summary:
+        df = pl.from_dicts(summary, infer_schema_length=None)
+        df.write_csv(Path(args.out_dir) / "summary.csv")
+        shown = [c for c in (
+            "cohort", "labels", "all_labels_prevalence", "all_labels_auroc", "all_labels_auprc",
+            "fully_followed_labels_auroc", "mean_risk", "trajectories_dropped_key_error",
+            "labels_without_valid_trajectory") if c in df.columns]
+        with pl.Config(tbl_cols=-1, tbl_width_chars=200):
+            print(df.select(shown))
+        print(f"Full table: {Path(args.out_dir) / 'summary.csv'}")
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()
