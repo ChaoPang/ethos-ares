@@ -7,6 +7,43 @@ import torch as th
 from .base import InferenceDataset
 
 
+# column names of the older cehr-bert / cehr-gpt label tables and their MEDS label equivalents
+LEGACY_LABEL_COLUMNS = {
+    "person_id": "subject_id",
+    "index_date": "prediction_time",
+    "label": "boolean_value",
+}
+
+
+def read_label_table(labels_fp: str | Path) -> pl.DataFrame:
+    """Reads label parquet file(s), a file or a folder searched recursively, as MEDS labels.
+
+    Besides the MEDS columns (subject_id, prediction_time, boolean_value), the older
+    person_id / index_date / label names are accepted and renamed. A 0/1 label becomes a boolean.
+    Other columns (e.g. time_to_event, outcome_date) are kept as they are.
+    """
+    labels_fp = Path(labels_fp)
+    source = str(labels_fp / "**" / "*.parquet") if labels_fp.is_dir() else labels_fp
+    df = pl.read_parquet(source)
+    original_columns = df.columns
+    df = df.rename(
+        {old: new for old, new in LEGACY_LABEL_COLUMNS.items()
+         if old in df.columns and new not in df.columns}
+    )
+    missing = [c for c in LEGACY_LABEL_COLUMNS.values() if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"'{labels_fp}' lacks {missing}; expected subject_id, prediction_time, boolean_value "
+            f"(or {list(LEGACY_LABEL_COLUMNS)}), found {original_columns}"
+        )
+    if df.schema["boolean_value"] != pl.Boolean:
+        values = set(df["boolean_value"].drop_nulls().unique().to_list())
+        if not values <= {0, 1}:
+            raise ValueError(f"The label column of '{labels_fp}' must be 0/1 or boolean, got {values}")
+        df = df.with_columns(pl.col("boolean_value").cast(pl.Boolean))
+    return df
+
+
 def _resolve_label_indices(
     dataset: InferenceDataset, labels_fp: str | Path, strict_cutoff: bool = False
 ) -> tuple[th.Tensor, list[dict]]:
@@ -30,10 +67,7 @@ def _resolve_label_indices(
     CUMC post_transform data the visit rows coincide with the labels' prediction_time.
     """
     labels_fp = Path(labels_fp)
-    labels_source = str(labels_fp / "**" / "*.parquet") if labels_fp.is_dir() else labels_fp
-    labels_df = pl.read_parquet(labels_source).select(
-        "subject_id", "prediction_time", "boolean_value"
-    )
+    labels_df = read_label_table(labels_fp).select("subject_id", "prediction_time", "boolean_value")
 
     pred_time_dtype = labels_df.schema["prediction_time"]
     if not isinstance(pred_time_dtype, pl.Datetime):

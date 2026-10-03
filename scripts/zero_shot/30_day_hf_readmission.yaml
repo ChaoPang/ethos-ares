@@ -1,0 +1,23 @@
+# 30-day readmission (cohort folder hf_readmission_sample).
+#
+# outcome_stokens: tokens that count as the event. A trajectory is generated from each label's
+#   prediction_time until it produces one of them (event), a stop token (MEDS_DEATH or
+#   TIMELINE_END, no event) or runs past time_limit_days (no event). The predicted risk is the
+#   share of trajectories that end in an event. Use the spelling of the tokenized vocab, which is
+#   upper case with underscores, e.g. VISIT/IP and CMS_PLACE_OF_SERVICE/51.
+# time_limit_days: the label's horizon.
+# strict_cutoff: true keeps only events strictly before prediction_time, for labels made at the
+#   very event that defines the outcome.
+#
+# The outcome is the next hospital admission: the admission codes of tokenize/omop/preprocessors.py
+# (HOSPITAL_ADMISSION itself is never produced for OMOP data). ETHOS's own 30-day readmission
+# benchmark also counts death as an event; add MEDS_DEATH to outcome_stokens to do the same.
+
+hf_readmission_sample:
+  outcome_stokens:
+    - VISIT/IP
+    - VISIT/ERIP
+    - CMS_PLACE_OF_SERVICE/51
+    - CMS_PLACE_OF_SERVICE/61
+  time_limit_days: 30
+  strict_cutoff: false

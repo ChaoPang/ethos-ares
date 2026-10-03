@@ -19,6 +19,8 @@ from pathlib import Path
 
 import polars as pl
 
+from ethos.datasets.meds_labels import read_label_table
+
 
 def parquet_files(path: str) -> list[Path]:
     p = Path(path).expanduser()
@@ -27,9 +29,8 @@ def parquet_files(path: str) -> list[Path]:
 
 def main(args):
     pl.Config.set_tbl_rows(30)
-    label_files = parquet_files(args.labels)
     meds_files = parquet_files(args.meds)
-    labels = pl.read_parquet(label_files)
+    labels = read_label_table(args.labels)
     meds_schema = pl.scan_parquet(meds_files[0]).collect_schema()
 
     print("label prediction_time :", labels.schema["prediction_time"])

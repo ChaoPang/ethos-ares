@@ -5,10 +5,13 @@ history up to prediction_time and generates `rep_num` future trajectories. A tra
 it produces an outcome token (an event), a stop token (death or end of the record) or when its
 generated time passes the cohort's time limit. The share of trajectories that ended in an event is
 the predicted risk, which is scored against boolean_value. This mirrors ETHOS's own 30-day
-readmission benchmark, with the outcome tokens taken from cohorts.yaml.
+readmission benchmark, with the outcome tokens taken from the yaml files next to this script
+(30_day_hf_readmission.yaml, 10_year_t2dm_hf.yaml, 1_year_cabg.yaml, one cohort each).
 
 The labels are matched to the tokenized split they belong to, so use the split the label patients
-come from (the zero-shot cohort samples are cut from held_out).
+come from (the zero-shot cohort samples are cut from held_out). A label table has subject_id,
+prediction_time and boolean_value; the older person_id, index_date and label names are accepted
+too (other columns, e.g. outcome_date, are ignored).
 
 Usage:
     python scripts/zero_shot/run_zero_shot.py \
@@ -16,7 +19,7 @@ Usage:
         --cohorts-dir ~/ohdsi.../ethos_zero_shot_cohorts \
         --tokenized-dir /path/to/ethos-output \
         --out-dir /path/to/zero_shot \
-        --cohorts hf_readmission_sample
+        --cohorts hf_readmission_sample t2dm_hf_sample cad_cabg_sample
 
 Rerunning continues where it stopped: the labels are cut into shards, finished shards are skipped
 and the scores are recomputed from all of them. Rerunning with a different checkpoint, labels,
@@ -42,6 +45,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from ethos.constants import SpecialToken as ST
 from ethos.datasets import MedsLabelledDataset
+from ethos.datasets.meds_labels import read_label_table
 from ethos.vocabulary import Vocabulary
 
 STOP_REASONS_KEPT = ("token_of_interest", "time_limit")  # key_error means an undecodable token
@@ -60,16 +64,31 @@ def hydra_list(values: list[str]) -> str:
     return "[" + ",".join(f"'{v}'" for v in values) + "]"
 
 
-def check_tokens(vocab: Vocabulary, tokens: list[str], cohort: str) -> None:
+def resolve_outcome_tokens(vocab: Vocabulary, tokens: list[str], cohort: str) -> list[str]:
+    """The outcome tokens that exist in the vocab.
+
+    A token that is missing but has a spelling variant in the vocab (case, spaces) is an error.
+    Otherwise it is genuinely absent, typically a rare code that `min_code_count` left out of the
+    vocab, so the model can never generate it: it is dropped and listed.
+    """
     missing = [t for t in tokens if t not in vocab.stoi]
     if not missing:
-        return
-    lines = []
-    for token in missing:
-        key = token.upper().replace(" ", "_")
-        close = [t for t in vocab.stoi if t.upper().replace(" ", "_") == key]
-        lines.append(f"  {token}" + (f"  (did you mean {close}?)" if close else ""))
-    raise ValueError(f"[{cohort}] outcome tokens not in the tokenized vocab:\n" + "\n".join(lines))
+        return tokens
+    normalized = {t.upper().replace(" ", "_"): t for t in vocab.stoi}
+    typos = {t: normalized[t.upper().replace(" ", "_")] for t in missing
+             if t.upper().replace(" ", "_") in normalized}
+    if typos:
+        lines = "\n".join(f"  {t}  (did you mean {v}?)" for t, v in typos.items())
+        raise ValueError(f"[{cohort}] outcome tokens with another spelling in the vocab:\n{lines}")
+    kept = [t for t in tokens if t in vocab.stoi]
+    if not kept:
+        raise ValueError(f"[{cohort}] none of the {len(tokens)} outcome tokens is in the vocab")
+    print(
+        f"[{cohort}] WARNING: {len(missing)} of {len(tokens)} outcome tokens are not in the vocab "
+        f"and can never be generated, so they are not part of the event: {missing}",
+        file=sys.stderr,
+    )
+    return kept
 
 
 def build_eval_set(
@@ -215,7 +234,12 @@ def score(
         "rep_num": rep_num,
         "all_labels": metrics(predictions),
     }
-    if "time_to_event" in predictions.columns:
+    # needs the follow-up of the negatives too; a label table with only the outcome date of the
+    # positives cannot give it
+    if (
+        "time_to_event" in predictions.columns
+        and predictions.filter(~pl.col("y"))["time_to_event"].null_count() == 0
+    ):
         # like ETHOS's "Reduced" readmission score: a negative only counts if the patient was
         # followed for the whole horizon, otherwise a readmission may simply not be recorded
         horizon = cohort_cfg["time_limit_days"]
@@ -241,8 +265,8 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
             f"[{cohort}] the {args.split} split was not tokenized with the train vocab. "
             f"Retokenize it with vocab={Path(args.tokenized_dir) / 'train'}."
         )
-    outcome = list(cohort_cfg["outcome_stokens"])
-    check_tokens(vocab, outcome, cohort)
+    outcome = resolve_outcome_tokens(vocab, list(cohort_cfg["outcome_stokens"]), cohort)
+    cohort_cfg = {**cohort_cfg, "outcome_stokens": outcome}
     base = [str(ST.DEATH), str(ST.TIMELINE_END)]
     include_base = all(t in vocab.stoi for t in base)
     if not include_base:
@@ -324,9 +348,9 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
             "Rerun to retry them."
         )
 
-    labels_all = pl.concat(
-        [pl.read_parquet(f) for f in parquet_files(labels_fp)], how="diagonal"
-    ).with_columns(pl.col("prediction_time").cast(pl.Datetime("us")))
+    labels_all = read_label_table(labels_fp).with_columns(
+        pl.col("prediction_time").cast(pl.Datetime("us"))
+    )
     return score(out, eval_set, labels_all, cohort_cfg, args.rep_num)
 
 
@@ -336,7 +360,11 @@ def main():
     parser.add_argument("--cohorts-dir", required=True, help="folder with one folder per cohort")
     parser.add_argument("--tokenized-dir", required=True, help="has the tokenized splits")
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--config", default=str(Path(__file__).with_name("cohorts.yaml")))
+    parser.add_argument(
+        "--config", nargs="+",
+        default=[str(p) for p in sorted(Path(__file__).parent.glob("*.yaml"))],
+        help="yaml file(s) with the outcome definition per cohort (default: all next to the script)",
+    )
     parser.add_argument("--cohorts", nargs="+", help="default: every cohort in the config")
     parser.add_argument("--split", default="held_out", help="tokenized split the labels belong to")
     parser.add_argument("--max-labels", type=int, default=0, help="0: all labels of the cohort")
@@ -350,7 +378,12 @@ def main():
 
     signal.signal(signal.SIGHUP, signal.SIG_IGN)  # a dropped SSH session must not stop the run
 
-    config = OmegaConf.to_container(OmegaConf.load(args.config))
+    config = {}
+    for config_fp in args.config:
+        for name, value in OmegaConf.to_container(OmegaConf.load(config_fp)).items():
+            if name in config:
+                raise SystemExit(f"Cohort {name} is defined in more than one config file")
+            config[name] = value
     cohorts = args.cohorts or list(config)
     unknown = [c for c in cohorts if c not in config]
     if unknown:
