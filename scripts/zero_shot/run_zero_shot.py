@@ -181,9 +181,17 @@ def run_shard(shard_dir, gpu, args, cohort_cfg, model_fp, tok_dir, include_base)
 
 
 def score(
-    out: Path, eval_set: pl.DataFrame, labels_all: pl.DataFrame, cohort_cfg: dict, rep_num: int
+    out: Path,
+    eval_set: pl.DataFrame,
+    labels_all: pl.DataFrame,
+    cohort_cfg: dict,
+    rep_num: int,
+    shard_dirs: list[Path] | None = None,
+    suffix: str = "",
 ) -> dict:
-    files = [f for shard in sorted((out / "shards").glob("shard_*")) for f in result_files(shard)]
+    """Scores the labels of `eval_set`, whose trajectories are in `shard_dirs` (default: all)."""
+    shard_dirs = shard_dirs or sorted((out / "shards").glob("shard_*"))
+    files = [f for shard in shard_dirs for f in result_files(shard)]
     results = pl.concat([pl.read_parquet(f, glob=False) for f in files], how="diagonal")
     if results.height != eval_set.height * rep_num:
         raise RuntimeError(
@@ -211,7 +219,7 @@ def score(
             on=["subject_id", "prediction_time"],
             how="left",
         )
-    predictions.write_parquet(out / "predictions.parquet")
+    predictions.write_parquet(out / f"predictions{suffix}.parquet")
 
     def metrics(df: pl.DataFrame) -> dict:
         y = df["y"].to_numpy()
@@ -234,6 +242,7 @@ def score(
         ),
         "mean_risk": float(predictions["risk"].mean()),
         "rep_num": rep_num,
+        "shards_scored": len(shard_dirs),
         "all_labels": metrics(predictions),
     }
     # needs the follow-up of the negatives too; a label table with only the outcome date of the
@@ -248,7 +257,7 @@ def score(
         res["fully_followed_labels"] = metrics(
             predictions.filter(pl.col("y") | (pl.col("time_to_event") >= horizon))
         )
-    (out / "metrics.json").write_text(json.dumps(res, indent=2))
+    (out / f"metrics{suffix}.json").write_text(json.dumps(res, indent=2))
     return res
 
 
@@ -323,6 +332,18 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
     pending = [d for d in shard_dirs if not (d / ".done").exists()]
     print(f"[{cohort}] {len(shard_dirs) - len(pending)}/{len(shard_dirs)} shards already done")
 
+    labels_all = read_label_table(labels_fp).with_columns(
+        pl.col("prediction_time").cast(pl.Datetime("us"))
+    )
+    if args.partial:
+        done = [d for d in shard_dirs if (d / ".done").exists()]
+        if not done:
+            raise RuntimeError(f"[{cohort}] no finished shard to score yet")
+        labels_done = pl.concat([pl.read_parquet(d / "labels" / "labels.parquet") for d in done])
+        print(f"[{cohort}] scoring the {len(done)}/{len(shard_dirs)} finished shards "
+              f"({labels_done.height:,} of {eval_set.height:,} labels)")
+        return score(out, labels_done, labels_all, cohort_cfg, args.rep_num, done, "_partial")
+
     failed = []
     lock = threading.Lock()
     started = {}
@@ -371,9 +392,6 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
             "Rerun to retry them."
         )
 
-    labels_all = read_label_table(labels_fp).with_columns(
-        pl.col("prediction_time").cast(pl.Datetime("us"))
-    )
     return score(out, eval_set, labels_all, cohort_cfg, args.rep_num)
 
 
@@ -397,6 +415,10 @@ def main():
     parser.add_argument("--jobs-per-gpu", type=int, default=2, help="processes sharing a GPU")
     parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--partial", action="store_true",
+        help="run nothing, score the shards that are finished (writes *_partial files)",
+    )
     parser.add_argument(
         "--progress-every", type=int, default=60, help="seconds between progress lines of running shards"
     )
@@ -439,14 +461,14 @@ def main():
 
     if summary:
         df = pl.from_dicts(summary, infer_schema_length=None)
-        df.write_csv(Path(args.out_dir) / "summary.csv")
+        df.write_csv(Path(args.out_dir) / ("summary_partial.csv" if args.partial else "summary.csv"))
         shown = [c for c in (
             "cohort", "labels", "all_labels_prevalence", "all_labels_auroc", "all_labels_auprc",
             "fully_followed_labels_auroc", "mean_risk", "trajectories_dropped_key_error",
             "labels_without_valid_trajectory") if c in df.columns]
         with pl.Config(tbl_cols=-1, tbl_width_chars=200):
             print(df.select(shown))
-        print(f"Full table: {Path(args.out_dir) / 'summary.csv'}")
+        print(f"Full table: {Path(args.out_dir) / ('summary_partial.csv' if args.partial else 'summary.csv')}")
     sys.exit(1 if failures else 0)
 
 
