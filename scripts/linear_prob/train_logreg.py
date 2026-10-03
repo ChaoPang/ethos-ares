@@ -23,7 +23,14 @@ from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
 
 
 def load_features(fps: list[Path]) -> dict:
-    df = pd.concat([pd.read_parquet(fp) for fp in fps], ignore_index=True)
+    files = []
+    for fp in fps:
+        # a features directory also holds meta.json / .done, so only take its parquet files
+        found = sorted(fp.glob("*.parquet")) if fp.is_dir() else [fp]
+        if not found:
+            raise FileNotFoundError(f"No parquet files in {fp}")
+        files.extend(found)
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
     return {
         "subject_id": df["subject_id"].to_numpy(),
         "prediction_time": df["prediction_time"].tolist(),

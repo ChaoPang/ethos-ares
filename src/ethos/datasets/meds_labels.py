@@ -7,13 +7,22 @@ import torch as th
 from .base import InferenceDataset
 
 
-def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> tuple[th.Tensor, list[dict]]:
+def _resolve_label_indices(
+    dataset: InferenceDataset, labels_fp: str | Path
+) -> tuple[th.Tensor, list[dict]]:
     """Matches ACES/MEDS labels (subject_id, prediction_time, boolean_value) to the index of
     the last token at or before each label's prediction_time.
 
     Returns (start_indices, rows) for only the labels that could be matched; labels whose
     subject_id isn't in the dataset, or whose prediction_time falls before that patient's
     first recorded token, are skipped.
+
+    prediction_time is compared as-is with the tokenized `times`, so the two must be on the same
+    clock. Do NOT convert it to UTC: in the OMOP MEDS data the clinical tables (condition,
+    drug_exposure, measurement, ...) share the labels' wall-clock time while the `visit` rows are
+    shifted by the UTC offset (+4/5 h for New York). Converting the labels would move the cutoff
+    that many hours past the true prediction time and let future clinical events into the input.
+    Those shifted visit rows (e.g. the visit-end row) fall after the cutoff and are left out.
     """
     labels_fp = Path(labels_fp)
     labels_source = str(labels_fp / "**" / "*.parquet") if labels_fp.is_dir() else labels_fp
@@ -30,6 +39,13 @@ def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> 
             "be matched against the tokenized dataset's `times` safely."
         )
 
+    if pred_time_dtype.time_zone is not None:
+        raise TypeError(
+            f"'prediction_time' in '{labels_fp}' is timezone-aware ({pred_time_dtype}), but the "
+            "tokenized times are naive. Convert it to the events' wall-clock time and store it "
+            "naive."
+        )
+
     labels_df = (
         labels_df
         # `times` is stored in microseconds since epoch (see TimelineDataset.tensorize), but a
@@ -38,7 +54,7 @@ def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> 
         .with_columns(
             prediction_time=pl.col("prediction_time").cast(pl.Datetime("us")).cast(pl.Int64)
         )
-        .sort("subject_id", "prediction_time")
+        .sort("subject_id", "prediction_time", maintain_order=True)
     )
 
     patient_starts = dataset.patient_offsets
@@ -66,6 +82,14 @@ def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> 
             # prediction_time falls before this patient's first recorded token
             skipped += 1
             continue
+        # never let the input reach past the prediction time
+        if times_slice[offset] > cutoff or (
+            offset + 1 < len(times_slice) and times_slice[offset + 1] <= cutoff
+        ):
+            raise RuntimeError(
+                f"Cutoff for subject {row['subject_id']} is not the last event at or before "
+                f"{row['prediction_time']}."
+            )
         start_indices.append(start + offset)
         kept_rows.append(row)
 
