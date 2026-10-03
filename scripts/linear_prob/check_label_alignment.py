@@ -12,25 +12,28 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import polars as pl
 
 
-def parquet_glob(path: str) -> str:
+def parquet_files(path: str) -> list[Path]:
     p = Path(path).expanduser()
-    return str(p / "**" / "*.parquet") if p.is_dir() else str(p)
+    return sorted(p.rglob("*.parquet")) if p.is_dir() else [p]
 
 
 def main(args):
     pl.Config.set_tbl_rows(30)
-    labels = pl.read_parquet(parquet_glob(args.labels))
-    meds = pl.scan_parquet(parquet_glob(args.meds))
-    meds_schema = meds.collect_schema()
+    label_files = parquet_files(args.labels)
+    meds_files = parquet_files(args.meds)
+    labels = pl.read_parquet(label_files)
+    meds_schema = pl.scan_parquet(meds_files[0]).collect_schema()
 
     print("label prediction_time :", labels.schema["prediction_time"])
     print("MEDS time             :", meds_schema["time"])
-    missing = [c for c in ("visit_id", "table") if c not in meds_schema.names()]
+    needed = ["subject_id", "time", "table", "visit_id"]
+    missing = [c for c in needed if c not in meds_schema.names()]
     if "visit_occurrence_id" not in labels.columns or missing:
         raise SystemExit(
             "The visit based check needs `visit_occurrence_id` in the labels and "
@@ -42,19 +45,32 @@ def main(args):
         "visit_occurrence_id",
         pl.col("prediction_time").cast(pl.Datetime("us")),
     ).unique()
-    if args.sample and len(labels) > args.sample:
-        labels = labels.sample(args.sample, seed=0)
+    # sample patients (not labels) and keep all of their labels, so memory stays small
+    subjects = labels.get_column("subject_id").unique()
+    if len(subjects) > args.sample_patients:
+        subjects = subjects.sample(args.sample_patients, seed=0)
+    labels = labels.filter(pl.col("subject_id").is_in(subjects))
 
-    # latest timestamp per (visit, source table)
-    visit_tables = (
-        meds.join(
-            labels.lazy().select("subject_id", "visit_occurrence_id").unique(),
-            left_on=["subject_id", "visit_id"],
-            right_on=["subject_id", "visit_occurrence_id"],
+    # latest timestamp per (patient, visit, source table), one MEDS file at a time
+    parts = []
+    for i, fp in enumerate(meds_files, 1):
+        scan = pl.scan_parquet(fp)
+        if any(c not in scan.collect_schema().names() for c in needed):
+            print(f"skipping {fp.name}: not an event file", file=sys.stderr)
+            continue
+        parts.append(
+            scan.select(needed)
+            .filter(pl.col("subject_id").is_in(subjects))
+            .group_by("subject_id", "visit_id", "table")
+            .agg(last_time=pl.col("time").max())
+            .collect()
         )
+        if i % 25 == 0:
+            print(f"scanned {i}/{len(meds_files)} MEDS files", file=sys.stderr)
+    visit_tables = (
+        pl.concat(parts)
         .group_by("subject_id", "visit_id", "table")
-        .agg(last_time=pl.col("time").max())
-        .collect()
+        .agg(last_time=pl.col("last_time").max())
     )
     joined = labels.join(
         visit_tables,
@@ -105,5 +121,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--labels", required=True, help="label parquet file or directory")
     parser.add_argument("--meds", required=True, help="MEDS parquet file or directory (all splits)")
-    parser.add_argument("--sample", type=int, default=100_000, help="max labels to check")
+    parser.add_argument(
+        "--sample-patients", type=int, default=5_000, help="patients to check, with all their labels"
+    )
     main(parser.parse_args())
