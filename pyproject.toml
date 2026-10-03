@@ -49,4 +49,4 @@ ethos_infer = "ethos.inference.run_inference:main"
 ethos_linear_prob_features = "ethos.inference.compute_features:main"
 
 [tool.setuptools.package-data]
-ethos = ["tokenize/maps/*.csv.gz"]
+ethos = ["tokenize/maps/*.csv.gz", "configs/*.yaml", "configs/dataset/*.yaml"]
