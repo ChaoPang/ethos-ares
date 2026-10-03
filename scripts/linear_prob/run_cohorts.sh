@@ -32,11 +32,14 @@
 #   - each cohort's output folder records the checkpoint, label files, tokenized data and
 #     settings it was made with. Rerunning with anything changed stops with an error instead of
 #     reusing stale features or a stale fitted model: delete the folder or use a new OUT_DIR.
-#   - label prediction_time is compared with the event times as-is. Do not convert it to UTC: in
-#     the OMOP MEDS data the `visit` rows are shifted by the UTC offset but the clinical tables
-#     are on the labels' clock (see check_label_alignment.py).
+#   - label prediction_time is compared with the event times as-is, and events at exactly that
+#     time are included. Check that both are on the same clock with check_label_alignment.py,
+#     and do not convert the labels to UTC without checking which tables are off. For a cohort
+#     whose label is made at the very event that defines the outcome (e.g. a visit-end row with
+#     the discharge disposition), list it in STRICT_COHORTS to keep only strictly earlier events.
 #
 # Optional: TRAIN_SPLITS="train tuning", TEST_SPLIT=held_out, EXCLUDE="logs", MEDS_DIR,
+# STRICT_COHORTS="discharge_home_death_meds ...",
 # GPU_IDS="0 1" (default: all GPUs; one worker per listed GPU, cohorts are spread over them),
 # NUM_GPUS, AVERAGE_OVER_SEQUENCE=false (true: mean-pool hidden states instead of using the
 # last token).
@@ -53,6 +56,7 @@ TRAIN_SPLITS=${TRAIN_SPLITS:-"train tuning"}
 TEST_SPLIT=${TEST_SPLIT:-held_out}
 EXCLUDE=${EXCLUDE:-logs}
 MEDS_DIR=${MEDS_DIR:-}
+STRICT_COHORTS=${STRICT_COHORTS:-}
 AVERAGE_OVER_SEQUENCE=${AVERAGE_OVER_SEQUENCE:-false}
 
 DEVICE=cuda
@@ -77,6 +81,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REF_SPLIT=${TRAIN_SPLITS%% *}
 
 [[ -f "$MODEL_FP" ]] || { echo "Checkpoint not found: $MODEL_FP" >&2; exit 1; }
+
+is_strict() { [[ " $STRICT_COHORTS " == *" $1 "* ]] && echo true || echo false; }
 
 first_file() { find -L "$1" -maxdepth 1 -name "$2" 2>/dev/null | sort | head -n 1; }
 
@@ -134,8 +140,8 @@ echo "Model: $MODEL_FP"
 echo "Cohorts (${#cohorts[@]}): ${cohorts[*]}"
 echo "Train splits: $TRAIN_SPLITS | test split: $TEST_SPLIT | device: $DEVICE, workers: $NUM_GPUS"
 
-signature() {  # <labels_fp>: fingerprint of everything the outputs depend on
-    python - "$MODEL_FP" "$1" "$TOKENIZED_DIR" "$TRAIN_SPLITS|$TEST_SPLIT|$AVERAGE_OVER_SEQUENCE" \
+signature() {  # <labels_fp> <strict>: fingerprint of everything the outputs depend on
+    python - "$MODEL_FP" "$1" "$TOKENIZED_DIR" "$TRAIN_SPLITS|$TEST_SPLIT|$AVERAGE_OVER_SEQUENCE|$2" \
         "$TRAIN_SPLITS $TEST_SPLIT" <<'EOF'
 import hashlib
 import os
@@ -168,7 +174,7 @@ EOF
 
 check_signature() {  # <cohort> <labels_fp>
     local sig_fp="$OUT_DIR/$1/signature" sig
-    sig=$(signature "$2") || return 1
+    sig=$(signature "$2" "$(is_strict "$1")") || return 1
     if [[ -f "$sig_fp" && "$(cat "$sig_fp")" != "$sig" ]]; then
         echo "[$1] the outputs in $OUT_DIR/$1 were made with a different checkpoint, labels," \
              "tokenized data or settings. Delete that folder or use another OUT_DIR." >&2
@@ -192,6 +198,7 @@ extract_features() {  # <cohort> <labels_fp> <split>
         output_dir="$OUT_DIR/$cohort" \
         output_fn="features_$split" \
         average_over_sequence="$AVERAGE_OVER_SEQUENCE" \
+        strict_cutoff="$(is_strict "$cohort")" \
         device="$DEVICE" && touch "$out/.done"
 }
 

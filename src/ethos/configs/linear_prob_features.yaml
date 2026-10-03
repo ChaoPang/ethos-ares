@@ -1,6 +1,8 @@
 model_fp: ???
 input_dir: ???
 labels_fp: ???
+# false: events at exactly prediction_time are part of the input; true: only strictly earlier ones
+strict_cutoff: false
 output_dir: "linear_prob_features"
 # features are written as a directory of parquet files, <output_dir>/<output_fn>/part-*.parquet
 output_fn: null # defaults to "features"

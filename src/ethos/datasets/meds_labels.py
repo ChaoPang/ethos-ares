@@ -8,7 +8,7 @@ from .base import InferenceDataset
 
 
 def _resolve_label_indices(
-    dataset: InferenceDataset, labels_fp: str | Path
+    dataset: InferenceDataset, labels_fp: str | Path, strict_cutoff: bool = False
 ) -> tuple[th.Tensor, list[dict]]:
     """Matches ACES/MEDS labels (subject_id, prediction_time, boolean_value) to the index of
     the last token at or before each label's prediction_time.
@@ -17,12 +17,17 @@ def _resolve_label_indices(
     subject_id isn't in the dataset, or whose prediction_time falls before that patient's
     first recorded token, are skipped.
 
-    prediction_time is compared as-is with the tokenized `times`, so the two must be on the same
-    clock. Do NOT convert it to UTC: in the OMOP MEDS data the clinical tables (condition,
-    drug_exposure, measurement, ...) share the labels' wall-clock time while the `visit` rows are
-    shifted by the UTC offset (+4/5 h for New York). Converting the labels would move the cutoff
-    that many hours past the true prediction time and let future clinical events into the input.
-    Those shifted visit rows (e.g. the visit-end row) fall after the cutoff and are left out.
+    prediction_time is compared as-is with the tokenized `times`, so both must be on the same
+    wall-clock; verify it with scripts/linear_prob/check_label_alignment.py instead of assuming
+    it. Events at exactly prediction_time are included, unless `strict_cutoff` is set, in which case
+    only events strictly before it are. Use that when the label is made at the very event that
+    defines the outcome (e.g. a visit-end row carrying the discharge disposition).
+
+    Do not convert the labels to UTC to "fix" a mismatch without checking which tables are off:
+    in one OMOP MEDS extract only the `visit` rows were shifted by the UTC offset while the
+    clinical tables shared the labels' clock, and converting would then push the cutoff up to
+    5 h past the true prediction time and let future clinical events into the input. In the
+    CUMC post_transform data the visit rows coincide with the labels' prediction_time.
     """
     labels_fp = Path(labels_fp)
     labels_source = str(labels_fp / "**" / "*.parquet") if labels_fp.is_dir() else labels_fp
@@ -77,17 +82,19 @@ def _resolve_label_indices(
             times_slice = dataset.times[start:end]
             cached_pid = row["subject_id"]
         cutoff = th.tensor(row["prediction_time"], dtype=times_slice.dtype)
-        offset = th.searchsorted(times_slice, cutoff, right=True).item() - 1
+        offset = th.searchsorted(times_slice, cutoff, right=not strict_cutoff).item() - 1
         if offset < 0:
             # prediction_time falls before this patient's first recorded token
             skipped += 1
             continue
         # never let the input reach past the prediction time
-        if times_slice[offset] > cutoff or (
-            offset + 1 < len(times_slice) and times_slice[offset + 1] <= cutoff
+        in_input = (lambda t: t < cutoff) if strict_cutoff else (lambda t: t <= cutoff)
+        if not in_input(times_slice[offset]) or (
+            offset + 1 < len(times_slice) and in_input(times_slice[offset + 1])
         ):
             raise RuntimeError(
-                f"Cutoff for subject {row['subject_id']} is not the last event at or before "
+                f"Cutoff for subject {row['subject_id']} is not the last event "
+                f"{'before' if strict_cutoff else 'at or before'} "
                 f"{row['prediction_time']}."
             )
         start_indices.append(start + offset)
@@ -121,10 +128,11 @@ class LabelledCohortDataset(InferenceDataset):
         input_dir: str | Path,
         labels_fp: str | Path,
         n_positions: int = 2048,
+        strict_cutoff: bool = False,
         **kwargs,
     ):
         super().__init__(input_dir, n_positions, **kwargs)
-        self.start_indices, self.labels = _resolve_label_indices(self, labels_fp)
+        self.start_indices, self.labels = _resolve_label_indices(self, labels_fp, strict_cutoff)
 
     def __len__(self) -> int:
         return len(self.start_indices)
@@ -167,6 +175,7 @@ class MedsLabelledDataset(InferenceDataset):
         n_positions: int = 2048,
         time_limit_days: float | None = None,
         include_base_stop_stokens: bool = True,
+        strict_cutoff: bool = False,
         **kwargs,
     ):
         super().__init__(input_dir, n_positions, **kwargs)
@@ -180,7 +189,7 @@ class MedsLabelledDataset(InferenceDataset):
         self._outcome_stokens = set(outcome_stokens)
         if time_limit_days is not None:
             self.time_limit = timedelta(days=time_limit_days)
-        self.start_indices, self.labels = _resolve_label_indices(self, labels_fp)
+        self.start_indices, self.labels = _resolve_label_indices(self, labels_fp, strict_cutoff)
 
     def __len__(self) -> int:
         return len(self.start_indices)

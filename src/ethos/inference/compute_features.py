@@ -65,6 +65,7 @@ def main(cfg: DictConfig):
         input_dir=cfg.input_dir,
         labels_fp=cfg.labels_fp,
         n_positions=n_positions,
+        strict_cutoff=cfg.strict_cutoff,
     )
     logger.info(f"{dataset} initialized with {len(dataset):,} labelled examples.")
 
@@ -84,6 +85,7 @@ def main(cfg: DictConfig):
         "model_mtime_ns": model_stat.st_mtime_ns,
         "labels_fp": str(Path(cfg.labels_fp).resolve()),
         "input_dir": str(Path(cfg.input_dir).resolve()),
+        "strict_cutoff": bool(cfg.strict_cutoff),
         "n_examples": len(dataset),
         "chunk_size": cfg.chunk_size,
         "average_over_sequence": bool(cfg.average_over_sequence),

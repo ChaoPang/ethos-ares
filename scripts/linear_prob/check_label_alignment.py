@@ -3,7 +3,9 @@
 For every label with a `visit_occurrence_id`, the MEDS rows of that visit are looked at per source
 table: how far their latest timestamp is from the label's prediction_time. A table that shares the
 labels' clock has a latest timestamp at (or before) prediction_time; a table shifted by the UTC
-offset shows a constant 4 h (daylight time) or 5 h (standard time) difference.
+offset shows a constant 4 h (daylight time) or 5 h (standard time) difference. `at_prediction_time`
+close to 1 for the `visit` table means the labels were made at the visit end and the visit-end row
+is included in the model input (the cutoff is inclusive).
 
 Usage:
     python scripts/linear_prob/check_label_alignment.py \
@@ -110,10 +112,13 @@ def main(args):
             .fill_null(0)
         )
     print(
-        "\nReading: a table with `at_prediction_time` high shares the labels' clock. A `visit` "
-        "table whose offset is 4 h in Apr-Oct and 5 h in Nov-Mar is shifted by the New York UTC "
-        "offset. Keep the labels as they are in that case: converting them would push the "
-        "cutoff past the true prediction time for the tables that share its clock."
+        "\nReading: a table with `at_prediction_time` high shares the labels' clock (a `visit` "
+        "offset of 0 h in every month means no mismatch). A constant 4 h (Apr-Oct) / 5 h "
+        "(Nov-Mar) offset on some tables means those tables are shifted by the New York UTC "
+        "offset; keep the labels as they are unless every table is shifted, since converting "
+        "them would move the cutoff past the true prediction time for the tables that share "
+        "its clock. If `visit` is at 1.0, the visit-end row is part of the input: fine when "
+        "it is legitimately known at the prediction time, a leak when it defines the outcome."
     )
 
 
