@@ -49,13 +49,17 @@ def _resolve_label_indices(dataset: InferenceDataset, labels_fp: str | Path) -> 
     }
 
     start_indices, kept_rows, skipped = [], [], 0
+    # labels are sorted by subject_id, so consecutive rows usually share a patient
+    cached_pid, times_slice = None, None
     for row in labels_df.iter_rows(named=True):
         pt_range = patient_range.get(row["subject_id"])
         if pt_range is None:
             skipped += 1
             continue
         start, end = pt_range
-        times_slice = dataset.times[start:end]
+        if row["subject_id"] != cached_pid:
+            times_slice = dataset.times[start:end]
+            cached_pid = row["subject_id"]
         cutoff = th.tensor(row["prediction_time"], dtype=times_slice.dtype)
         offset = th.searchsorted(times_slice, cutoff, right=True).item() - 1
         if offset < 0:

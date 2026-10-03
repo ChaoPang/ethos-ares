@@ -32,11 +32,20 @@ def main(cfg: DictConfig):
 
     autocast_context = setup_torch(device, dtype="bfloat16" if "cuda" in device else "float32")
 
-    output_dir = Path(cfg.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_fn = cfg.output_fn or "features.parquet"
+    out_dir = Path(cfg.output_dir) / (cfg.output_fn or "features")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    rows, n_chunks, n_written = [], 0, 0
+
+    def flush():
+        nonlocal rows, n_chunks, n_written
+        if not rows:
+            return
+        pl.DataFrame(rows).write_parquet(out_dir / f"part-{n_chunks:05d}.parquet")
+        n_chunks += 1
+        n_written += len(rows)
+        rows = []
+
     with th.no_grad():
         for x, y in tqdm(dataset, desc="Computing features", total=len(dataset)):
             x = x.unsqueeze(0).to(device, non_blocking=True)
@@ -56,10 +65,12 @@ def main(cfg: DictConfig):
                     "features": features.float().cpu().numpy().tolist(),
                 }
             )
+            # features are held as python lists (~25 KB per row at n_embd=768), so flush often
+            if len(rows) >= cfg.chunk_size:
+                flush()
+    flush()
 
-    out_fp = output_dir / output_fn
-    pl.DataFrame(rows).write_parquet(out_fp)
-    logger.info(f"Saved {len(rows):,} feature rows to '{out_fp}'")
+    logger.info(f"Saved {n_written:,} feature rows in {n_chunks} file(s) to '{out_dir}'")
 
 
 if __name__ == "__main__":
