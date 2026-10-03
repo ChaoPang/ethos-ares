@@ -31,11 +31,13 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -323,9 +325,27 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
 
     failed = []
     lock = threading.Lock()
+    started = {}
+    stop_heartbeat = threading.Event()
+
+    def heartbeat():
+        """Prints the progress bar line of every running shard, which ethos_infer only writes to
+        the shard's run.log."""
+        while not stop_heartbeat.wait(args.progress_every):
+            for shard_dir in pending:
+                log = shard_dir / "run.log"
+                if shard_dir.name not in started or (shard_dir / ".done").exists() or not log.exists():
+                    continue
+                tail = log.read_bytes()[-4096:].decode(errors="ignore")
+                bars = [seg for seg in re.split(r"[\r\n]", tail) if "Progress:" in seg]
+                if bars:
+                    minutes = int(time.time() - started[shard_dir.name]) // 60
+                    line = " ".join(re.sub(r"\|[^|]*\|", " ", bars[-1]).split())
+                    print(f"[{cohort}] {shard_dir.name} {minutes} min: {line}", flush=True)
 
     def worker(w: int):
         for shard_dir in pending[w :: len(gpus)]:
+            started[shard_dir.name] = time.time()
             try:
                 ok = run_shard(shard_dir, gpus[w], args, cohort_cfg, model_fp, tok_dir, include_base)
             except Exception as e:  # an exception in a thread would otherwise vanish silently
@@ -337,10 +357,13 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
                     failed.append(shard_dir.name)
 
     threads = [threading.Thread(target=worker, args=(w,)) for w in range(len(gpus))]
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
     for t in threads:
         t.start()
+    heartbeat_thread.start()
     for t in threads:
         t.join()
+    stop_heartbeat.set()
     unfinished = [d.name for d in shard_dirs if not (d / ".done").exists()]
     if failed or unfinished:
         raise RuntimeError(
@@ -374,7 +397,13 @@ def main():
     parser.add_argument("--jobs-per-gpu", type=int, default=2, help="processes sharing a GPU")
     parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--progress-every", type=int, default=60, help="seconds between progress lines of running shards"
+    )
     args = parser.parse_args()
+
+    sys.stdout.reconfigure(line_buffering=True)  # show progress in a redirected log right away
+    sys.stderr.reconfigure(line_buffering=True)
 
     signal.signal(signal.SIGHUP, signal.SIG_IGN)  # a dropped SSH session must not stop the run
 
