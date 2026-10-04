@@ -283,25 +283,29 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
     if not include_base:
         print(f"[{cohort}] {base} are not all in the vocab, so they are not used as stop tokens")
 
-    signature = hashlib.sha1(
-        json.dumps(
-            {
-                "model": file_signature([model_fp]),
-                "labels": file_signature(parquet_files(labels_fp)),
-                "tokenized": file_signature(sorted(tok_dir.glob("*.pickle")) + sorted(tok_dir.glob("vocab_t*.csv")))
-                + [str(len(list(tok_dir.glob("[0-9]*.safetensors"))))],
-                "cohort": OmegaConf.to_container(OmegaConf.create(cohort_cfg)),
-                "rep_num": args.rep_num, "max_labels": args.max_labels,
-                "shard_size": args.shard_size, "seed": args.seed, "split": args.split,
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
+    parts = {
+        "model": file_signature([model_fp]),
+        "labels": file_signature(parquet_files(labels_fp)),
+        "tokenized": file_signature(sorted(tok_dir.glob("*.pickle")) + sorted(tok_dir.glob("vocab_t*.csv")))
+        + [str(len(list(tok_dir.glob("[0-9]*.safetensors"))))],
+        "cohort": OmegaConf.to_container(OmegaConf.create(cohort_cfg)),
+        "rep_num": args.rep_num, "max_labels": args.max_labels,
+        "shard_size": args.shard_size, "seed": args.seed, "split": args.split,
+    }
+    signature = json.dumps(parts, sort_keys=True, indent=1)
     sig_fp = out / "signature"
-    if sig_fp.exists() and sig_fp.read_text() != signature:
+    # older versions stored only the sha1 of the compact json
+    legacy = hashlib.sha1(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+    if sig_fp.exists() and sig_fp.read_text() not in (signature, legacy):
+        try:
+            old = json.loads(sig_fp.read_text())
+            changed = [f"{k}: {old.get(k)!r} -> {parts.get(k)!r}"[:300]
+                       for k in sorted(parts) if old.get(k) != parts[k]]
+        except json.JSONDecodeError:  # written by an older version, which stored only a hash
+            changed = ["not known: the signature was written by an older version"]
         raise RuntimeError(
             f"[{cohort}] {out} was made with a different checkpoint, labels, tokenized data or "
-            "setting. Delete it or use another --out-dir."
+            "setting. Delete it or use another --out-dir. Different:\n  " + "\n  ".join(changed)
         )
 
     eval_fp = out / "eval_set.parquet"
@@ -411,7 +415,11 @@ def main():
     parser.add_argument("--max-labels", type=int, default=0, help="0: all labels of the cohort")
     parser.add_argument("--rep-num", type=int, default=10, help="trajectories per label")
     parser.add_argument("--shard-size", type=int, default=500, help="labels per ethos_infer run")
-    parser.add_argument("--gpu-ids", nargs="*", help="default: all visible GPUs, else the CPU")
+    parser.add_argument(
+        "--gpu-ids",
+        nargs="*",
+        help="GPU ids of the machine; default: those in CUDA_VISIBLE_DEVICES, else all, else the CPU",
+    )
     parser.add_argument("--jobs-per-gpu", type=int, default=2, help="processes sharing a GPU")
     parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
     parser.add_argument("--seed", type=int, default=0)
@@ -442,6 +450,11 @@ def main():
 
     if args.gpu_ids is not None:
         gpus = [int(g) for g in args.gpu_ids] or [None]
+    elif os.environ.get("CUDA_VISIBLE_DEVICES"):
+        # each shard gets one of these ids as its own CUDA_VISIBLE_DEVICES, so they have to be the
+        # ids of the machine (export CUDA_VISIBLE_DEVICES=0,2 means GPUs 0 and 2, not 0 and 1)
+        gpus = [int(g) if g.strip().isdigit() else g.strip()
+                for g in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if g.strip()]
     else:
         import torch
 

@@ -1,16 +1,26 @@
 # Heart failure after type 2 diabetes (cohort folder t2dm_hf_sample), 10 year horizon.
 #
-# Derived from CEHR-GPT's time_to_event/config/t2dm_hf_ethos.yaml. Its seed concepts are ICD10CM
-# I50, I50.84, I50.89, I50.9 and ICD9CM 428, 428.9, 404.13 (include_descendants adds nothing: ICD
-# concepts have no rows in concept_ancestor). CEHR-GPT matches token paths, so the one-token paths
-# for I50 and 428 are prefix wildcards for every I50.* and 428.* code.
-# The ETHOS tokenizer turns both families into the same category token (ICD-9 428.* is converted
-# to I50.*), so one stop token is the whole definition:
-#   ICD10CM/I50.9 -> ICD//CM//HEART_FAILURE, ICD//CM//3-6//9
-#   ICD9CM/428.0  -> ICD//CM//HEART_FAILURE
-# 404.13 becomes two tokens (ICD//CM//HYPERTENSIVE_HEART_AND_CHRONIC_KIDNEY_DISEASE,
-# ICD//CM//3-6//2), which cannot be a stop token, and the category alone also covers I13.10/I13.11
-# without heart failure. It is left out, which drops only that rare code.
+# Derived from CEHR-GPT's time_to_event/config/t2dm_hf_ethos.yaml. Its seed concepts are
+# translated with the ETHOS tokenizer, which splits an ICD-10-CM code into the category token
+# (named after the description of the 3 character code) plus `ICD//CM//3-6//..` and
+# `ICD//CM//SFX//..` tokens, and converts ICD-9-CM codes to ICD-10-CM first.
+# ICD//CM//HEART_FAILURE is emitted for every I50.* code and for ICD-9 428.*, so this one token
+# covers 6 of the 7 seed concepts (as in CEHR-GPT, where the one-token I50 and 428 paths match
+# every code that starts with them):
+#
+#   concept   code          tokenized as
+#   1569178   ICD10CM I50     [HEART_FAILURE]
+#   35207793  ICD10CM I50.9   [HEART_FAILURE, 3-6//9]
+#   1326608   ICD10CM I50.84  [HEART_FAILURE, 3-6//84]
+#   1326609   ICD10CM I50.89  [HEART_FAILURE, 3-6//89]
+#   44824250  ICD9CM  428     [HEART_FAILURE]
+#   44827796  ICD9CM  428.9   [HEART_FAILURE]
+#
+# Left out: ICD9CM 404.13 (44820856), a rare code of another category (hypertensive heart and
+# chronic kidney disease, ICD//CM//HYPERTENSIVE_HEART_AND_CHRONIC_KIDNEY_DISEASE followed by the
+# shared suffix token ICD//CM//3-6//2). A stop token has to be a single token, and the category
+# alone also covers I13.10 / I13.11 without heart failure.
+# include_descendants adds nothing: ICD concepts have no rows in concept_ancestor.
 # CEHR-GPT ignores events in the first 30 days (prediction_window_start) and has no end
 # (prediction_window_end: -1). ethos_infer stops at the first outcome token wherever it falls, so
 # the 30 day start is not applied, and the open-ended window is approximated by a 10 year horizon.
