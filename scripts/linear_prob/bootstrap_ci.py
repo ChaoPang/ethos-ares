@@ -5,6 +5,10 @@ bootstrap resamples patients with all their labels, not single labels. Each repl
 patients as the test set has, with replacement; a patient drawn twice counts twice (as a sample
 weight). The interval is the percentile interval of the replicates.
 
+The csv has the estimate, interval and standard deviation of the replicates, and the columns
+roc_auc_text / pr_auc_text in the form 65.8±0.6% (the estimate, plus or minus half the width of the
+interval; `--plus-minus std` uses the standard deviation of the replicates instead).
+
 PR-AUC is computed as in train_logreg.py (trapezoid area under the precision-recall curve), so the
 point estimate matches metrics.json. `--pr-auc average_precision` uses the average precision of
 zero-shot runs instead (scripts/zero_shot/run_zero_shot.py).
@@ -85,6 +89,13 @@ def bootstrap(fp: Path, args) -> dict:
             float(v) for v in np.percentile(reps[:, i], [lo, hi])
         )
         result[f"{name}_boot_mean"] = float(reps[:, i].mean())
+        result[f"{name}_boot_std"] = float(reps[:, i].std(ddof=1))
+        half = (
+            (result[f"{name}_high"] - result[f"{name}_low"]) / 2
+            if args.plus_minus == "ci"
+            else result[f"{name}_boot_std"]
+        )
+        result[f"{name}_text"] = f"{100 * point:.1f}±{100 * half:.1f}%"
     return result
 
 
@@ -104,8 +115,7 @@ def main(args):
         rows.append({"cohort": cohort, **res})
         print(
             f"{cohort:32s} n={res['n_labels']:>7,} patients={res['n_patients']:>7,} "
-            f"ROC-AUC {res['roc_auc']:.3f} [{res['roc_auc_low']:.3f}, {res['roc_auc_high']:.3f}]  "
-            f"PR-AUC {res['pr_auc']:.3f} [{res['pr_auc_low']:.3f}, {res['pr_auc_high']:.3f}]",
+            f"ROC-AUC {res['roc_auc_text']}  PR-AUC {res['pr_auc_text']}",
             flush=True,
         )
     pl.DataFrame(rows).write_csv(results_dir / "bootstrap_ci.csv")
@@ -120,6 +130,13 @@ if __name__ == "__main__":
     parser.add_argument("--cohorts", nargs="+", help="default: every cohort found")
     parser.add_argument("--n-boot", type=int, default=1000, help="bootstrap replicates")
     parser.add_argument("--alpha", type=float, default=0.05, help="0.05: 95%% interval")
+    parser.add_argument(
+        "--plus-minus",
+        choices=["ci", "std"],
+        default="ci",
+        help="the ± of the text columns (65.8±0.6%%): half the width of the interval, or the "
+        "standard deviation of the replicates",
+    )
     parser.add_argument("--pr-auc", choices=["trapezoid", "average_precision"], default="trapezoid")
     parser.add_argument("--n-jobs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
