@@ -22,8 +22,10 @@ Usage:
         --cohorts hf_readmission_sample t2dm_hf_sample cad_cabg_sample
 
 Rerunning continues where it stopped: the labels are cut into shards, finished shards are skipped
-and the scores are recomputed from all of them. Rerunning with a different checkpoint, labels,
-tokenized data or setting stops with an error instead of mixing results.
+and the scores are recomputed from all of them. A shard that stopped before it finished keeps the
+labels whose trajectories are all there (the results are written every --flush-labels labels) and
+only the other labels of the shard are generated again. Rerunning with a different checkpoint,
+labels, tokenized data or setting stops with an error instead of mixing results.
 """
 
 import argparse
@@ -130,20 +132,75 @@ def result_files(shard_dir: Path) -> list[Path]:
     return sorted((shard_dir / "results").rglob("samples_*.parquet"))
 
 
+LABEL_KEYS = ["subject_id", "prediction_time"]
+
+
+def read_results(shard_dir: Path) -> pl.DataFrame | None:
+    files = result_files(shard_dir)
+    if not files:
+        return None
+    return pl.concat([pl.read_parquet(f, glob=False) for f in files], how="diagonal")
+
+
+def labels_left(shard_dir: Path, labels: pl.DataFrame, rep_num: int) -> pl.DataFrame:
+    """The labels of a shard that do not have all their trajectories yet.
+
+    Trajectories of a label that are only partly there (the run stopped while the label was
+    generated) are removed, so that nothing is counted twice when the label is generated again.
+    The trajectories of the other labels are kept as they are.
+    """
+    results_dir, old, new = shard_dir / "results", shard_dir / "results.old", shard_dir / "results.new"
+    if old.exists():  # an earlier run stopped while it replaced the results
+        shutil.rmtree(old) if results_dir.exists() else old.rename(results_dir)
+    shutil.rmtree(new, ignore_errors=True)
+
+    results = read_results(shard_dir)
+    if results is None:
+        return labels
+    expected = labels.group_by(LABEL_KEYS).len().with_columns(expected=pl.col("len") * rep_num)
+    found = results.group_by("patient_id", "prediction_time").len().rename({"patient_id": "subject_id"})
+    complete = found.join(expected.drop("len"), on=LABEL_KEYS).filter(pl.col("len") == pl.col("expected"))
+    complete_keys = complete.select(LABEL_KEYS)
+
+    kept = results.join(
+        complete_keys.rename({"subject_id": "patient_id"}), on=["patient_id", "prediction_time"], how="semi"
+    )
+    if kept.height != results.height:  # some labels are only partly there: drop their trajectories
+        if kept.height:
+            new.mkdir()
+            kept.write_parquet(new / "samples_kept.parquet")
+            results_dir.rename(old)
+            new.rename(results_dir)
+            shutil.rmtree(old)
+        else:
+            shutil.rmtree(results_dir)
+    return labels.join(complete_keys, on=LABEL_KEYS, how="anti")
+
+
 def run_shard(shard_dir, gpu, args, cohort_cfg, model_fp, tok_dir, include_base) -> bool:
     if (shard_dir / ".done").exists():
         return True
-    n_labels = pl.read_parquet(shard_dir / "labels" / "labels.parquet").height
-    shutil.rmtree(shard_dir / "results", ignore_errors=True)  # partial output of an earlier run
+    labels = pl.read_parquet(shard_dir / "labels" / "labels.parquet")
+    todo = labels_left(shard_dir, labels, args.rep_num)  # keeps what an earlier run finished
+    if todo.height == 0:
+        (shard_dir / ".done").touch()
+        return True
+
+    todo_dir = shard_dir / "labels_todo"
+    shutil.rmtree(todo_dir, ignore_errors=True)
+    todo_dir.mkdir()
+    todo.write_parquet(todo_dir / "labels.parquet")
+    attempt = len(list((shard_dir / "results").glob("attempt_*")))  # an attempt never overwrites another
 
     cmd = [
         sys.executable, "-m", "ethos.inference.run_inference",
         "task=meds_label",
         f"model_fp={model_fp}",
         f"input_dir={tok_dir}",
-        f"output_dir={shard_dir / 'results'}",
+        f"output_dir={shard_dir / 'results' / f'attempt_{attempt:03d}'}",
         "output_fn=run",
-        f"+dataset_kwargs.labels_fp={shard_dir / 'labels'}",
+        f"result_chunk_size={args.rep_num * args.flush_labels}",
+        f"+dataset_kwargs.labels_fp={todo_dir}",
         f"+dataset_kwargs.outcome_stoken={hydra_list(cohort_cfg['outcome_stokens'])}",
         f"+dataset_kwargs.time_limit_days={cohort_cfg['time_limit_days']}",
         f"+dataset_kwargs.include_base_stop_stokens={str(include_base).lower()}",
@@ -160,24 +217,23 @@ def run_shard(shard_dir, gpu, args, cohort_cfg, model_fp, tok_dir, include_base)
     env = dict(os.environ)
     if gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    with open(shard_dir / "run.log", "w") as log:
+    with open(shard_dir / "run.log", "a") as log:
+        log.write(f"\n=== attempt {attempt}: {todo.height} of {labels.height} labels ===\n")
+        log.flush()
         returncode = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
 
-    # ethos_infer exits 0 even if a worker died and the progress queue timed out, so count rows
-    n_rows = sum(
-        pl.scan_parquet(f, glob=False).select(pl.len()).collect().item()
-        for f in result_files(shard_dir)
-    )
-    ok = returncode == 0 and n_rows == n_labels * args.rep_num
-    if ok:
+    # ethos_infer exits 0 even if a worker died and the progress queue timed out, so count the
+    # labels that have all their trajectories
+    left = labels_left(shard_dir, labels, args.rep_num)
+    if left.height == 0:
         (shard_dir / ".done").touch()
-    else:
-        print(
-            f"  {shard_dir}: {n_rows} of {n_labels * args.rep_num} trajectories "
-            f"(exit code {returncode}), see {shard_dir / 'run.log'}",
-            file=sys.stderr,
-        )
-    return ok
+        return True
+    print(
+        f"  {shard_dir}: {labels.height - left.height} of {labels.height} labels done, "
+        f"{left.height} left, kept for the next run (exit code {returncode}), see {shard_dir / 'run.log'}",
+        file=sys.stderr,
+    )
+    return False
 
 
 def score(
@@ -421,6 +477,10 @@ def main():
         help="GPU ids of the machine; default: those in CUDA_VISIBLE_DEVICES, else all, else the CPU",
     )
     parser.add_argument("--jobs-per-gpu", type=int, default=2, help="processes sharing a GPU")
+    parser.add_argument(
+        "--flush-labels", type=int, default=20,
+        help="results are written every this many labels, so a stopped shard keeps them",
+    )
     parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
