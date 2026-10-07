@@ -97,6 +97,63 @@ def create_loader(queue: Queue, dataset) -> Generator[tuple[th.Tensor, dict], No
         yield from (dataset[i] for i in indices)
 
 
+def group_by_length(
+    loader: Generator[tuple, None, None], batch_labels: int
+) -> Generator[list[tuple], None, None]:
+    """Groups up to `batch_labels` examples whose timelines have the same length, so that they can
+    be generated in one batch without padding. The rest of each length is returned at the end."""
+    buffers: dict[int, list[tuple]] = {}
+    for timeline, ground_truth in loader:
+        if batch_labels <= 1 or isinstance(timeline, tuple):
+            yield [(timeline, ground_truth)]
+            continue
+        group = buffers.setdefault(timeline.size(0), [])
+        group.append((timeline, ground_truth))
+        if len(group) >= batch_labels:
+            yield buffers.pop(timeline.size(0))
+    yield from buffers.values()
+
+
+class KVCacheSampler:
+    """Samples the next token of a decoder-only model with a cache of keys and values.
+
+    The cache holds the timeline but its newest token, so a step computes only that token and not
+    the whole window again. The model has absolute position embeddings, which means that the cache
+    cannot be shifted when the window is full. Then the oldest `slide` tokens after the static
+    context are dropped and the rest of the window is computed again, so the window is between
+    `slide` tokens shorter than the full one and the full one, instead of always the full one.
+    """
+
+    def __init__(self, model, max_size: int, ctx_size: int, slide: int, temperature: float = 1.0):
+        if not 0 < slide < max_size - ctx_size:
+            raise ValueError(f"slide has to be between 1 and {max_size - ctx_size - 1}, not {slide}")
+        self.model, self.max_size, self.ctx_size = model, max_size, ctx_size
+        self.slide, self.temperature = slide, temperature
+        self.past = None
+
+    @th.inference_mode()
+    def next_token(self, timeline: th.Tensor):
+        """Returns the next token, its probabilities and the timeline (shortened when it slid)."""
+        if self.past is not None and timeline.size(1) > self.max_size:
+            timeline = th.cat(
+                (timeline[:, : self.ctx_size], timeline[:, self.ctx_size + self.slide :]), dim=1
+            )
+            self.past = None
+        if self.past is None:
+            out = self.model(timeline, use_cache=True)
+        else:
+            out = self.model(timeline[:, -1:], past_kvs=self.past, use_cache=True)
+        self.past = out.past_kvs
+        logits = out.logits[:, -1, :] / self.temperature
+        probs = F.softmax(logits, dim=-1)
+        return th.multinomial(probs, num_samples=1), probs, timeline
+
+    @th.inference_mode()
+    def select(self, mask: th.Tensor):
+        """Keeps the rows of the batch where `mask` is True."""
+        self.past = [(k[mask], v[mask]) for k, v in self.past]
+
+
 def get_token_time(tokens: Sequence, vocab) -> th.Tensor:
     """Returns time in microseconds."""
     if isinstance(tokens, th.Tensor):

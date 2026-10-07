@@ -30,3 +30,4 @@ class Reason(StrEnum):
     GOT_TOKEN = "token_of_interest"
     KEY_ERROR = "key_error"
     TIME_LIMIT = "time_limit"
+    TOKEN_LIMIT = "token_limit"  # the generation reached max_new_tokens
