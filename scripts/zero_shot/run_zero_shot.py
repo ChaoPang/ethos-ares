@@ -52,7 +52,7 @@ from ethos.datasets import MedsLabelledDataset
 from ethos.datasets.meds_labels import read_label_table
 from ethos.vocabulary import Vocabulary
 
-STOP_REASONS_KEPT = ("token_of_interest", "time_limit")  # key_error means an undecodable token
+STOP_REASONS_KEPT = ("token_of_interest", "time_limit")  # key_error: an undecodable token, token_limit: no end within the budget
 
 
 def parquet_files(path: Path) -> list[Path]:
@@ -200,6 +200,9 @@ def run_shard(shard_dir, gpu, args, cohort_cfg, model_fp, tok_dir, include_base)
         f"output_dir={shard_dir / 'results' / f'attempt_{attempt:03d}'}",
         "output_fn=run",
         f"result_chunk_size={args.rep_num * args.flush_labels}",
+        *([f"max_new_tokens={args.max_new_tokens}"] if args.max_new_tokens else []),
+        *([f"kv_slide={args.kv_slide}"] if args.kv_slide else []),
+        f"batch_labels={args.batch_labels}",
         f"+dataset_kwargs.labels_fp={todo_dir}",
         f"+dataset_kwargs.outcome_stoken={hydra_list(cohort_cfg['outcome_stokens'])}",
         f"+dataset_kwargs.time_limit_days={cohort_cfg['time_limit_days']}",
@@ -291,7 +294,8 @@ def score(
     res = {
         "labels": eval_set.height,
         "trajectories": results.height,
-        "trajectories_dropped_key_error": results.height - kept.height,
+        "trajectories_dropped_key_error": int((results["stop_reason"] == "key_error").sum()),
+        "trajectories_dropped_token_limit": int((results["stop_reason"] == "token_limit").sum()),
         "labels_without_valid_trajectory": eval_set.height - predictions.height,
         "share_ended_by_time_limit": float(
             (kept["stop_reason"] == "time_limit").mean() if kept.height else float("nan")
@@ -348,6 +352,8 @@ def run_cohort(cohort: str, cohort_cfg: dict, args, gpus: list) -> dict:
         "rep_num": args.rep_num, "max_labels": args.max_labels,
         "shard_size": args.shard_size, "seed": args.seed, "split": args.split,
     }
+    if args.kv_slide:  # only when used, so the signature of earlier runs stays valid
+        parts["kv_slide"] = args.kv_slide
     signature = json.dumps(parts, sort_keys=True, indent=1)
     sig_fp = out / "signature"
     # older versions stored only the sha1 of the compact json
@@ -480,6 +486,25 @@ def main():
     parser.add_argument(
         "--flush-labels", type=int, default=20,
         help="results are written every this many labels, so a stopped shard keeps them",
+    )
+    parser.add_argument(
+        "--kv-slide", type=int, default=0,
+        help="generate with a cache of keys and values, which is much faster. When the context "
+        "window is full it slides by this many tokens and the rest of it is computed again, so the "
+        "window is between this many tokens shorter than the full one and the full one (e.g. 256 "
+        "for a 2048 window). 0: compute the whole window for every token, exact but slow. It "
+        "changes the trajectories slightly, so it is part of the run's signature",
+    )
+    parser.add_argument(
+        "--batch-labels", type=int, default=1,
+        help="labels generated together when their timelines have the same length, which keeps "
+        "the GPU busier (rep-num x batch-labels sequences at once). Does not change the results",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=0,
+        help="stop a trajectory after this many generated tokens (0: no limit). Such a trajectory "
+        "is not scored, it is counted in trajectories_dropped_token_limit. Not part of the run's "
+        "signature, so it can be added when a run is resumed",
     )
     parser.add_argument("--timeout", type=int, default=3600, help="seconds to wait for a result")
     parser.add_argument("--seed", type=int, default=0)

@@ -102,6 +102,9 @@ def main(cfg: DictConfig):
                     "cpu" if cfg.device == "cpu" else f"cuda:{i % cfg.n_gpus}",
                     cfg.no_compile,
                     cfg.save_generated_tokens,
+                    cfg.max_new_tokens,
+                    cfg.kv_slide,
+                    cfg.batch_labels,
                 ),
                 name=f"Process_{i}",
             )

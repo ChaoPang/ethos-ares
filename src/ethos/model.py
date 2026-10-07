@@ -8,7 +8,9 @@ import transformers.activations
 from torch.nn import functional as F
 from transformers import GPT2Config
 
-ModelOutput = namedtuple("ModelOutput", ["loss", "logits", "hidden_states"], defaults=[None])
+ModelOutput = namedtuple(
+    "ModelOutput", ["loss", "logits", "hidden_states", "past_kvs"], defaults=[None, None]
+)
 
 
 class CausalSelfAttention(nn.Module):
@@ -37,8 +39,11 @@ class CausalSelfAttention(nn.Module):
             )
         self.attention_weights = attention_weights
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
+        """With `past_kv` (the keys and values of the earlier tokens) `x` is the one next token."""
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        if past_kv is not None and T != 1:
+            raise ValueError("A cache of earlier tokens can only be used to add one token")
 
         # calculate query, key, values for all heads in batch and move head forward to be the
         # batch dim
@@ -46,6 +51,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        if past_kv is not None:
+            k = torch.cat((past_kv[0], k), dim=2)
+            v = torch.cat((past_kv[1], v), dim=2)
+        present = (k, v) if use_cache else None
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash and self.attention_weights is None:
@@ -56,11 +66,12 @@ class CausalSelfAttention(nn.Module):
                 v,
                 attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
+                is_causal=past_kv is None,  # one new token sees all the cached ones
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            if past_kv is None:
+                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -71,7 +82,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return (y, present) if use_cache else y
 
 
 class MLP(nn.Module):
@@ -98,10 +109,14 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, past_kv=None, use_cache=False):
+        if use_cache:
+            attn_out, present = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True)
+        else:
+            attn_out, present = self.attn(self.ln_1(x)), None
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return (x, present) if use_cache else x
 
 
 class GPT2LMNoBiasModel(nn.Module):
@@ -155,16 +170,29 @@ class GPT2LMNoBiasModel(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def forward(self, input_ids, labels=None, output_hidden_states=False) -> ModelOutput:
+    def forward(
+        self, input_ids, labels=None, output_hidden_states=False, past_kvs=None, use_cache=False
+    ) -> ModelOutput:
+        """`use_cache` also returns the keys and values of the tokens (`past_kvs`, one pair per
+        layer). Passing them back with the one next token computes only that token, at the
+        position after the cached ones."""
         _, t = input_ids.size()
         if self.return_attention:
             self.attention_weights.clear()
+        past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
 
         tok_emb = self.transformer.wte(input_ids)
-        pos_emb = self.transformer.wpe(self.pos[:t])
+        pos_emb = self.transformer.wpe(self.pos[past_len : past_len + t])
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        presents = []
+        for i, block in enumerate(self.transformer.h):
+            if use_cache:
+                x, present = block(
+                    x, past_kv=past_kvs[i] if past_kvs is not None else None, use_cache=True
+                )
+                presents.append(present)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if labels is not None:
@@ -174,7 +202,12 @@ class GPT2LMNoBiasModel(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        return ModelOutput(loss=loss, logits=logits, hidden_states=x if output_hidden_states else None)
+        return ModelOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=x if output_hidden_states else None,
+            past_kvs=presents if use_cache else None,
+        )
 
     @torch.no_grad()
     def get_next_token(self, x: torch.Tensor, return_probs: bool = False, top_k: int | None = None):
